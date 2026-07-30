@@ -7,21 +7,41 @@ __maximum_python_version__ = (3, 14)
 # We simply pre-load all imports for the signature extension.
 # Also, PyInstaller seems not always to be reliable in finding modules.
 # We explicitly import everything that is needed:
-import sys
-import os
-import zipfile
-import base64
-import marshal
-import io
-import contextlib
-import textwrap
-import traceback
-import types
-import struct
-import re
-import tempfile
-import keyword
-import functools
-import typing
 
-from shiboken6.Shiboken import *
+from shiboken6.Shiboken import (
+    Object,
+    VoidPtr,
+    createdByPython,
+    delete,
+    disassembleFrame,
+    dump,
+    dumpConverters,
+    dumpTypeGraph,
+    dumpWrapperMap,
+    getAllValidWrappers,
+    getCppPointer,
+    invalidate,
+    isValid,
+    ownedByPython,
+    replaceModuleDict,
+    wrapInstance,
+)
+
+__all__ = [
+    "Object",
+    "VoidPtr",
+    "createdByPython",
+    "delete",
+    "disassembleFrame",
+    "dump",
+    "dumpConverters",
+    "dumpTypeGraph",
+    "dumpWrapperMap",
+    "getAllValidWrappers",
+    "getCppPointer",
+    "invalidate",
+    "isValid",
+    "ownedByPython",
+    "replaceModuleDict",
+    "wrapInstance",
+]
