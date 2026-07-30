@@ -11,17 +11,17 @@ def patch_sdk_error():
     """
     try:
         from plugin.sdk.plugin import SdkError
-        
+
         if hasattr(SdkError, '__message_patched__'):
             return  # 已经 patch 过
-        
+
         _orig_init = SdkError.__init__
-        
+
         def _patched_init(self, message="", *args, **kwargs):
             _orig_init(self, message, *args, **kwargs)
             if not hasattr(self, 'message') or self.message is None:
                 object.__setattr__(self, 'message', str(self.args[0]) if self.args else str(message))
-        
+
         SdkError.__init__ = _patched_init
         SdkError.__message_patched__ = True
     except ImportError:

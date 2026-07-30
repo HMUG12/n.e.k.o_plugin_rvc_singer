@@ -1,0 +1,9 @@
+
+blank_issues_enabled: false
+contact_links:
+  - name: A 端插件仓库
+    url: https://github.com/HMUG12/n.e.k.o_plugin_rvc_singer
+    about: A-side plugin source, issues, and release notes (this repo)
+  - name: B 端 RVC Studio
+    url: https://github.com/HMUG12/NEKO_rvcsinger-B
+    about: RVC Studio 独立桌面程序（配套后端）

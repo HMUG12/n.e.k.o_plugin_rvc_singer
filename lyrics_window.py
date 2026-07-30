@@ -32,22 +32,37 @@ Floating Lyrics Window — 独立桌面悬浮歌词窗口 V2
 """
 from __future__ import annotations
 
-import json, os, time, math
-from pathlib import Path
-from typing import Optional
-from queue import Queue, Empty
+import time
+from queue import Empty, Queue
 
 from PySide6.QtCore import (
-    Qt, QTimer, QRect, QRectF, QPoint, QSize, Signal, QObject,
-    QPropertyAnimation, QEasingCurve, Property,
+    Property,
+    QEasingCurve,
+    QObject,
+    QPropertyAnimation,
+    QRectF,
+    Qt,
+    QTimer,
+    Signal,
 )
 from PySide6.QtGui import (
-    QFont, QColor, QPainter, QPen, QBrush, QFontMetrics,
-    QMouseEvent, QPainterPath, QLinearGradient,
+    QColor,
+    QFontMetrics,
+    QLinearGradient,
+    QMouseEvent,
+    QPainter,
+    QPen,
 )
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QApplication, QFrame, QGraphicsOpacityEffect,
+    QApplication,
+    QFrame,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QVBoxLayout,
+    QWidget,
 )
 
 
@@ -89,7 +104,7 @@ class KaraokeLabel(QWidget):
         self.setStyleSheet("background: transparent;")
 
     def set_params(self, text: str, progress: float = 0.0,
-                   char_progress: list = None,
+                   char_progress: list | None = None,
                    font_size: int = 18, bold: bool = True):
         self._text = text
         self._progress = max(0.0, min(1.0, progress))
@@ -123,7 +138,6 @@ class KaraokeLabel(QWidget):
 
         chars = list(self._text)
         char_widths = [fm.horizontalAdvance(ch) for ch in chars]
-        total_w = sum(char_widths)
 
         # 计算高亮到的位置
         if self._char_progress and len(self._char_progress) >= len(chars):
@@ -213,8 +227,8 @@ class _LyricsQueue(QObject):
 
 
 # 全局句柄
-_lyrics_queue: Optional[_LyricsQueue] = None
-_window: Optional["LyricsFloatingWindow"] = None
+_lyrics_queue: _LyricsQueue | None = None
+_window: LyricsFloatingWindow | None = None
 
 
 def show_lyrics_window():
@@ -234,6 +248,20 @@ def hide_lyrics_window():
     global _window
     if _window:
         _window.hide_with_animation()
+
+
+def destroy_lyrics_window():
+    """销毁歌词窗口（完全释放 Qt 资源，防止僵尸窗口阻塞退出）"""
+    global _window, _lyrics_queue
+    if _window:
+        try:
+            _window.hide()
+            _window.close()
+            _window.deleteLater()
+        except Exception:
+            pass
+        _window = None
+        _lyrics_queue = None
 
 
 def push_lyrics_data(data: dict):
@@ -492,7 +520,6 @@ class LyricsFloatingWindow(QMainWindow):
 
     # ── 右键菜单 ──
     def contextMenuEvent(self, event):
-        from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu { background: #1e1e2e; color: #cdd6f4; border:1px solid #313244; border-radius:8px; }
@@ -519,6 +546,11 @@ class LyricsFloatingWindow(QMainWindow):
         self._fade_anim.stop()
         self._fade_anim.setStartValue(self._opacity_effect.opacity())
         self._fade_anim.setEndValue(0.0)
+        # 先断开旧连接再重连，防止快速重复调用导致信号累积 → disconnect 异常
+        try:
+            self._fade_anim.finished.disconnect(self._on_fadeout_done)
+        except (TypeError, RuntimeError):
+            pass
         self._fade_anim.finished.connect(self._on_fadeout_done)
         self._fade_anim.start()
 
@@ -554,9 +586,11 @@ class LyricsFloatingWindow(QMainWindow):
 
         elif action == "pause":
             self._playing = False
+            self._sync_timer.stop()
 
         elif action == "resume":
             self._playing = True
+            self._sync_timer.start(50)
             # 恢复时调整起始时间偏移
             elapsed = data.get("elapsed", 0)
             if elapsed > 0:
@@ -570,6 +604,7 @@ class LyricsFloatingWindow(QMainWindow):
 
         elif action == "stop":
             self._playing = False
+            self._sync_timer.stop()
             self._lyrics = []
             self._char_times = []
             self._current_index = -1
@@ -645,7 +680,6 @@ class LyricsFloatingWindow(QMainWindow):
 
         # 当前句
         cur_text = lines[idx]["text"] if idx < len(lines) else ""
-        cur_duration = lines[idx].get("duration", 3.0)
         font_size = 18 if len(cur_text) <= 15 else (14 if len(cur_text) <= 25 else 12)
         self._current_label.set_params(cur_text, progress=0, font_size=font_size)
 
@@ -702,7 +736,6 @@ class LyricsFloatingWindow(QMainWindow):
         """行切换时短暂放大效果"""
         # 简单实现：不做脉冲，避免过度复杂
         # 如需脉冲，可在此添加 QPropertyAnimation 缩放标签
-        pass
 
     @staticmethod
     def _fmt_time(seconds: float) -> str:
