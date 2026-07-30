@@ -28,38 +28,39 @@ import json
 import os
 import sys
 import time
-from typing import Any
+import traceback
 from datetime import datetime
+from typing import Any
+from urllib.parse import quote, urlencode, urlparse
 
 # ── 将插件目录加入 sys.path，确保本地依赖（如 PySide6）可导入 ──
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from plugin.sdk.plugin import (
-    NekoPluginBase,
-    neko_plugin,
-    llm_tool,
-    plugin_entry,
-    lifecycle,
-    ui,
-    tr,
-    Ok,
+from plugin.sdk.plugin import (  # noqa: E402
     Err,
+    NekoPluginBase,
+    Ok,
     SdkError,
+    lifecycle,
+    neko_plugin,
+    plugin_entry,
+    tr,
+    ui,
 )
 
 # 导入新的模块（核心依赖，无外部依赖）
-from .http_client import AsyncHttpClient
-from .state import patch_sdk_error
-from .cache import CacheLayer
-from .queue_engine import SongQueueEngine, QueueSnapshot
+from .cache import CacheLayer, _MISSING  # noqa: E402  # _MISSING 用于区分"未命中"与"data is None"
+from .http_client import AsyncHttpClient  # noqa: E402
+from .queue_engine import QueueSnapshot, SongQueueEngine  # noqa: E402
+from .state import patch_sdk_error  # noqa: E402
 
 # ── PySide6 可选依赖：缺失时降级为 no-op stub ──
 # 悬浮歌词/队列窗口依赖 PySide6，但 NEKO 环境可能未安装。
 # 导入失败时提供空操作 stub，核心功能（HTTP 通信）不受影响。
 try:
-    from .lyrics_window import show_lyrics_window, push_lyrics_data, hide_lyrics_window
+    from .lyrics_window import hide_lyrics_window, push_lyrics_data, show_lyrics_window
 except ImportError:
     def show_lyrics_window(): pass
     def push_lyrics_data(data): pass
@@ -67,7 +68,10 @@ except ImportError:
 
 try:
     from .queue_window import (
-        show_queue_window, push_queue_data, hide_queue_window, set_cancel_callback,
+        hide_queue_window,
+        push_queue_data,
+        set_cancel_callback,
+        show_queue_window,
     )
 except ImportError:
     def show_queue_window(): pass
@@ -144,14 +148,22 @@ class RvcSingerPlugin(NekoPluginBase):
         self._bg_tasks: set[asyncio.Task] = set()
         self._cancel_event: asyncio.Event = asyncio.Event()
         self._rvc_root: str = ""
-        self._default_model: str = "yui-pro"
+        self._default_model: str = ""  # 空字符串 = 自动选择第一个可用模型
         self._active_task_id: str | None = None
         self._last_progress: int = 0
         self._last_step: str = ""
         self._last_song_name: str = ""
         self._last_model: str = ""
         self._last_pitch_shift: int = 0
+        self._last_postprocess: str = "none"  # 上次使用的音效后处理预设
         self._last_task_type: str = ""  # "sing" | "compare"
+        self._auto_mix: bool = True  # 混音开关（从 GUI 同步）
+        # M6: 混音配置（从 GUI 同步，供 sing_song 调用 B 端 /api/sing 时使用）
+        self._mix_preset: str = "general"
+        self._mix_vocal_db: float = 0.0
+        self._mix_inst_db: float = -1.0
+        self._mix_reverb: float = 0.0
+        self._mix_original: float = 0.0
         
         # ── 缓存机制 ──
         self._cache = CacheLayer()
@@ -166,6 +178,7 @@ class RvcSingerPlugin(NekoPluginBase):
         self._status_change_threshold: float = 2.0
         self._sticky_status: dict = {}
         self._ever_connected: bool = False  # 曾经连上过（控制首次检查策略）
+        self._ever_connected_before: bool = False  # 曾同步过 GUI 配置
 
         # ── 错误统计 ──
         self._consecutive_failures: int = 0
@@ -213,7 +226,7 @@ class RvcSingerPlugin(NekoPluginBase):
             self._use_https = bool(settings.get("use_https", False))
             self._ssl_verify = bool(settings.get("ssl_verify", True))
             self._rvc_root = settings.get("rvc_root_path", "")
-            self._default_model = settings.get("default_model", "yui-pro")
+            self._default_model = settings.get("default_model", "")
         except (asyncio.TimeoutError, Exception):
             self.logger.warning("config.dump() 超时/不可用，使用内存默认值启动")
 
@@ -242,8 +255,10 @@ class RvcSingerPlugin(NekoPluginBase):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, show_lyrics_window)
             await loop.run_in_executor(None, show_queue_window)
-            set_cancel_callback(lambda song_name: asyncio.create_task(
-                self._queue_engine.cancel(song_name)))
+            # 跨线程回调：使用 call_soon_threadsafe 避免 no-running-loop 崩溃
+            set_cancel_callback(lambda song_name: loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(
+                    self._queue_engine.cancel(song_name), loop=loop)))
             self.logger.info("悬浮歌词窗口 & 队列窗口已启动（含取消回调节点）")
         except Exception as e:
             self.logger.warning(f"显示浮窗失败（非致命）: {e}")
@@ -263,20 +278,40 @@ class RvcSingerPlugin(NekoPluginBase):
                 await self._windows_task
             except asyncio.CancelledError:
                 pass
-        # 取消所有后台任务
-        for task in list(self._bg_tasks):
+        # 取消并等待所有后台任务完成（带超时保护，防止卡死的任务阻塞退出）
+        bg_tasks = list(self._bg_tasks)
+        for task in bg_tasks:
             task.cancel()
+        if bg_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*bg_tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning("后台任务未在 5 秒内清理完成，强制继续关闭")
         # 清空队列
         await self._queue_engine.cancel_all()
-        # 隐藏浮窗
+        # 销毁浮窗（参考旧版 RVCStudio 最佳实践: 不仅隐藏，要完全销毁窗口对象）
         try:
             hide_lyrics_window()
             hide_queue_window()
-        except Exception:
+            # 尝试调用销毁函数（如果存在）
+            from .lyrics_window import destroy_lyrics_window
+        except ImportError:
             pass
-        # 关闭 HTTP 客户端
+        else:
+            destroy_lyrics_window()
+        try:
+            from .queue_window import destroy_queue_window
+        except ImportError:
+            pass
+        else:
+            destroy_queue_window()
+        # 关闭 HTTP 客户端并置空
         if self._http_client:
             await self._http_client.close()
+            self._http_client = None
         return Ok({"status": "shutdown"})
 
     # ═══════════════ 异步 HTTP 核心（使用 aiohttp，符合 NEKO asyncio 标准）═══════════════
@@ -289,6 +324,7 @@ class RvcSingerPlugin(NekoPluginBase):
         valid, err_msg = _validate_host_port(self._studio_host, self._studio_port)
         if not valid:
             self._studio_available = False
+            self._rvc_ready = False
             self.logger.error(f"配置错误: {err_msg}")
             return
         
@@ -314,6 +350,11 @@ class RvcSingerPlugin(NekoPluginBase):
                 self.logger.info("健康检查成功: Studio 状态 = %s, rvc_ready=%s",
                                  self._studio_available, rvc_ready)
                 await self._send_log_to_studio("info", f"健康检查通过: online={self._studio_available}, rvc_ready={rvc_ready}")
+
+                # 每次健康检查成功都同步 GUI 设置（而非仅首次），
+                # 确保用户在 GUI 中修改 default_model / auto_mix 后立即生效
+                await self._sync_gui_config_from_studio()
+                self._ever_connected_before = True
                 return
             else:
                 self._consecutive_failures += 1
@@ -326,7 +367,73 @@ class RvcSingerPlugin(NekoPluginBase):
         
         # 所有重试都失败
         self._studio_available = False
+        self._rvc_ready = False
         self.logger.warning(f"健康检查失败: 重试{max_retries}次后仍无法连接到 {self._studio_url}")
+
+
+    async def _sync_gui_config_from_studio(self):
+        """从 B 端 /api/config 同步用户在 GUI 中设置的首选项。
+
+        解决 GUI 配置文件 (~/.rvc_studio/config.json) 与 NEKO 插件
+        store/config 存储隔离的问题。同步项：
+        - default_model: 默认模型名
+        - auto_mix: 是否自动混音
+        - pitch_shift: 默认变调
+        - audio_preset: 后处理预设
+        """
+        try:
+            s, cfg_data = await self._http_client.get("/api/config", timeout=5)
+            if s == 200 and isinstance(cfg_data, dict):
+                gui_model = cfg_data.get("default_model", "")
+                if gui_model:
+                    self._default_model = gui_model
+                    self.logger.info("从 GUI 同步默认模型: %s", gui_model)
+                else:
+                    self.logger.debug("GUI 未设置默认模型，保持当前: %s", self._default_model)
+
+                gui_auto_mix = cfg_data.get("auto_mix")
+                if gui_auto_mix is not None:
+                    self._auto_mix = bool(gui_auto_mix)
+                    self.logger.info("从 GUI 同步混音设置: %s", self._auto_mix)
+
+                gui_pitch = cfg_data.get("pitch_shift")
+                if gui_pitch is not None:
+                    self._last_pitch_shift = int(gui_pitch)
+
+                gui_preset = cfg_data.get("audio_preset")
+                if gui_preset:
+                    self._last_postprocess = gui_preset
+
+                # M6: 同步混音配置（预设 + 4 个滑块）
+                mix_preset = cfg_data.get("mix_preset")
+                if mix_preset:
+                    self._mix_preset = str(mix_preset)
+                mix_vocal_db = cfg_data.get("mix_vocal_db")
+                if mix_vocal_db is not None:
+                    try:
+                        self._mix_vocal_db = float(mix_vocal_db)
+                    except (TypeError, ValueError):
+                        pass
+                mix_inst_db = cfg_data.get("mix_inst_db")
+                if mix_inst_db is not None:
+                    try:
+                        self._mix_inst_db = float(mix_inst_db)
+                    except (TypeError, ValueError):
+                        pass
+                mix_reverb = cfg_data.get("mix_reverb")
+                if mix_reverb is not None:
+                    try:
+                        self._mix_reverb = float(mix_reverb)
+                    except (TypeError, ValueError):
+                        pass
+                mix_original = cfg_data.get("mix_original")
+                if mix_original is not None:
+                    try:
+                        self._mix_original = float(mix_original)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception as e:
+            self.logger.debug("同步 GUI 配置失败（非致命）: %s", e)
 
 
     def _full_status(self, **overrides) -> dict:
@@ -364,7 +471,7 @@ class RvcSingerPlugin(NekoPluginBase):
         """
         self.logger.info("后台健康检查启动，等待 Studio 初始化...")
         # 暖机延迟：给 Studio 服务端启动时间（避免过早判定离线）
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
         check_count = 0
         while True:
             check_count += 1
@@ -404,7 +511,6 @@ class RvcSingerPlugin(NekoPluginBase):
                     "[健康检查 #{}] 异常: {} - {}",
                     check_count, type(e).__name__, e,
                 )
-                import traceback
                 self.logger.error(
                     "[健康检查 #{}] 堆栈: {}",
                     check_count, traceback.format_exc(),
@@ -413,22 +519,8 @@ class RvcSingerPlugin(NekoPluginBase):
             # 离线时加速轮询（10s），在线时保持 30s 心跳
             await asyncio.sleep(10 if not self._studio_available else 30)
 
-    # ═══════════════ AI 入口 ═══════════════
+    # ═══════════════ UI 入口（唯一调用链路） ═══════════════
 
-    @llm_tool(
-        name="sing_song",
-        description="让N.E.K.O用RVC训练的音色模型演唱指定歌曲。用户说'唱首歌'、'唱一首XX'、'来一首'、'sing'时调用。支持音调调整和后处理音效（混响、降噪等）。音色自动使用当前配置的默认模型，无需指定。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "song_name": {"type": "string", "description": "歌曲名称。如果刚用search_and_download_song下载了歌曲，必须用其返回的song_name字段（不要用搜索词）"},
-                "pitch_shift": {"type": "integer", "description": "变调（半音），-12到+12，0=不变"},
-                "postprocess": {"type": "string", "description": "音效预设：none/studio/live/ktv/bright/warm/denoise"}
-            },
-            "required": ["song_name"]
-        },
-        timeout=120.0,
-    )
     @plugin_entry(
         id="sing_song",
         name="唱首歌",
@@ -436,7 +528,10 @@ class RvcSingerPlugin(NekoPluginBase):
             "让N.E.K.O用RVC训练好的声音唱歌。\n"
             "⚠️ 使用场景：用户说'唱首歌'、'来一首'、'sing a song'等请求时调用。\n"
             "⚠️ Studio 连接会自动检查，如果未连接会自动返回提示，无需调用额外工具确认。\n"
-            "⚠️ 音色自动使用面板/配置中的默认模型，不要询问用户用什么模型！\n"
+            "⚠️ 模型选择：\n"
+            "  • 用户明确说'用XX模型唱'、'换XX唱'时，传入model_name参数\n"
+            "  • 否则使用默认模型（不要主动询问用什么模型）\n"
+            "  • 可用模型列表通过 check_studio_status 查询\n"
             "🔑 歌曲名规则：song_name 必须使用 search_and_download_song 返回的 song_name 字段！\n"
             "  不要用你自己想的搜索词，因为平台存储的歌名可能不同（如日文原名 vs 中文翻译）。\n"
             "  例如：搜「怪物之歌」时返回的 song_name 是「バケモノの唄」，必须用后者调用本入口。\n"
@@ -457,6 +552,14 @@ class RvcSingerPlugin(NekoPluginBase):
                         "歌曲名称。如果刚用 search_and_download_song 下载了歌曲，"
                         "必须填写其返回结果中的 song_name（不要用你自己的搜索词，因为缓存的歌名可能不同）"
                     )
+                },
+                "model_name": {
+                    "type": "string",
+                    "description": (
+                        "RVC模型名称。用户明确说'用XX模型唱'、'换XX唱'时填写，"
+                        "否则留空使用默认模型。可用模型可通过 check_studio_status 查询。"
+                    ),
+                    "default": ""
                 },
                 "pitch_shift": {
                     "type": "integer",
@@ -481,8 +584,15 @@ class RvcSingerPlugin(NekoPluginBase):
     async def sing_song(
         self,
         song_name: str = "",
+        model_name: str = "",
         pitch_shift: int = 0,
         postprocess: str = "none",
+        # M6: 混音配置（可选，未传则用 GUI 同步的 self._mix_*）
+        mix_preset: str | None = None,
+        mix_vocal_db: float | None = None,
+        mix_inst_db: float | None = None,
+        mix_reverb: float | None = None,
+        mix_original: float | None = None,
         **_,
     ):
         """主入口：处理唱歌请求
@@ -493,7 +603,7 @@ class RvcSingerPlugin(NekoPluginBase):
         3. 后台通过 push_message 推送进度和最终结果
         4. 避免入口函数超时（默认 30s）
         
-        改进：并发控制、参数验证
+        改进：并发控制、参数验证、模型切换支持
         """
         # ── 参数验证 ──
         if not song_name or not isinstance(song_name, str):
@@ -518,7 +628,62 @@ class RvcSingerPlugin(NekoPluginBase):
         if postprocess not in _valid_pp:
             postprocess = "none"
 
-        model = self._default_model
+        # ── 模型选择：用户指定 > 默认模型 > 自动选择第一个可用模型 ──
+        model_name = (model_name or "").strip()
+        
+        # 先拉取可用模型列表（用于校验和自动选择）
+        available_models = []
+        if self._studio_available:
+            try:
+                status, data = await self._http_client.get("/api/models", timeout=5)
+                if status == 200 and isinstance(data, dict):
+                    available_models = data.get("models", [])
+            except Exception as e:
+                self.logger.warning(f"获取模型列表失败: {e}")
+        
+        if model_name:
+            # 用户明确指定模型，校验模型是否存在
+            if available_models:
+                model_stem = model_name.replace(".pth", "")
+                if not any(m.replace(".pth", "") == model_stem for m in available_models):
+                    return Err(SdkError(
+                        f"喵～找不到模型「{model_name}」呢！\n"
+                        f"可用模型: {', '.join(available_models[:10])}\n"
+                        "可以调用 check_studio_status 查看完整模型列表哦～"
+                    ))
+                model = model_stem
+            else:
+                model = model_name.replace(".pth", "")
+                self.logger.warning(f"无法校验模型 {model_name}，将尝试使用")
+            self.logger.info(f"用户指定模型: {model}")
+        else:
+            # 使用默认模型，如果为空或不存在则自动选择第一个
+            if self._default_model and available_models:
+                default_stem = self._default_model.replace(".pth", "")
+                if any(m.replace(".pth", "") == default_stem for m in available_models):
+                    model = default_stem
+                    self.logger.info(f"使用默认模型: {model}")
+                else:
+                    # 默认模型在 API 返回的列表中不存在（可能是名称差异或模型被删除）
+                    # 仅回退到第一个可用模型用于本次演唱，不持久化覆盖用户选择
+                    old_default = self._default_model
+                    model = available_models[0].replace(".pth", "")
+                    self.logger.warning(
+                        "默认模型「%s」不在可用模型列表中，本次回退到: %s（不持久化）",
+                        old_default, model
+                    )
+            elif available_models:
+                model = available_models[0].replace(".pth", "")
+                self.logger.info("未设置默认模型，自动选择: %s", model)
+                # 仅当之前确实没有默认模型时才持久化
+                if not self._default_model:
+                    self._default_model = model
+                    try:
+                        await self.store.set("settings", {"default_model": model})
+                    except Exception:
+                        pass
+            else:
+                model = self._default_model.replace(".pth", "") if self._default_model else ""
 
         # ── 并发控制：原子化抢占 active_task_id ──
         async with self._task_lock:
@@ -549,8 +714,23 @@ class RvcSingerPlugin(NekoPluginBase):
         # model 已在并发控制前计算，此处仅更新状态
         self._last_model = model
         self._last_pitch_shift = pitch_shift
+        self._last_postprocess = postprocess
         self._last_task_type = "sing"
-        self.logger.info(f"唱歌请求: song={song_name}, model={model}, pitch={pitch_shift}, pp={postprocess}")
+        # M6: 记住本次的混音参数（重试时回放）
+        if mix_preset is not None: self._mix_preset = str(mix_preset)
+        if mix_vocal_db is not None:
+            try: self._mix_vocal_db = float(mix_vocal_db)
+            except (TypeError, ValueError): pass
+        if mix_inst_db is not None:
+            try: self._mix_inst_db = float(mix_inst_db)
+            except (TypeError, ValueError): pass
+        if mix_reverb is not None:
+            try: self._mix_reverb = float(mix_reverb)
+            except (TypeError, ValueError): pass
+        if mix_original is not None:
+            try: self._mix_original = float(mix_original)
+            except (TypeError, ValueError): pass
+        self.logger.info(f"唱歌请求: song={song_name}, model={model}, pitch={pitch_shift}, pp={postprocess}, mix={self._mix_preset}/{self._mix_vocal_db}/{self._mix_inst_db}/{self._mix_reverb}/{self._mix_original}")
         await self._send_log_to_studio("info", f"收到演唱请求: song={song_name}, model={model}, pitch={pitch_shift}, pp={postprocess}")
 
         # ── 提交处理请求到 RVC Studio ──
@@ -559,6 +739,12 @@ class RvcSingerPlugin(NekoPluginBase):
             model_name=model,
             pitch_shift=pitch_shift,
             postprocess=postprocess,
+            # M6: 透传混音配置
+            mix_preset=mix_preset,
+            mix_vocal_db=mix_vocal_db,
+            mix_inst_db=mix_inst_db,
+            mix_reverb=mix_reverb,
+            mix_original=mix_original,
         )
         if isinstance(task_result, Err):
             async with self._task_lock:
@@ -611,11 +797,13 @@ class RvcSingerPlugin(NekoPluginBase):
             "song_name": song_name,
         })
 
-    @llm_tool(
-        name="cancel_song",
-        description="取消当前正在执行的歌曲合成或对比任务。用户说'取消'、'停下'、'别唱了'时调用。",
-        parameters={"type": "object", "properties": {}},
-        timeout=10.0,
+    @ui.action(
+        label="⏹ 取消任务",
+        icon="⏹",
+        tone="danger",
+        group="control",
+        order=1,
+        refresh_context=True,
     )
     @plugin_entry(
         id="cancel_song",
@@ -629,14 +817,6 @@ class RvcSingerPlugin(NekoPluginBase):
         ),
         input_schema={"type": "object", "properties": {}},
         llm_result_fields=["cancelled", "previously_active_id", "message"],
-    )
-    @ui.action(
-        label="⏹ 取消任务",
-        icon="⏹",
-        tone="danger",
-        group="control",
-        order=1,
-        refresh_context=True,
     )
     async def cancel_song(self, **_):
         """强制取消当前活跃任务，释放并发锁"""
@@ -727,34 +907,48 @@ class RvcSingerPlugin(NekoPluginBase):
             "message": "任务已取消" if prev_id else "没有活跃任务需要取消",
         })
 
-    @llm_tool(
-        name="check_studio_status",
-        description="检查RVC Studio独立程序是否在线、可用模型列表、连接状态。用户问'状态'、'能用吗'、'有哪些模型'时调用。",
-        parameters={"type": "object", "properties": {}},
-        timeout=10.0,
-    )
     @plugin_entry(
         id="check_studio_status",
         name="检查RVC Studio状态",
-        description="检查 RVC Studio 独立程序是否在线、可用模型列表、当前状态",
+        description="检查 RVC Studio 独立程序是否在线、可用模型列表、当前状态。用于查询可用的RVC声音模型。",
         input_schema={"type": "object", "properties": {}},
-        llm_result_fields=["online", "models", "status"],
+        llm_result_fields=["online", "models", "status", "default_model"],
     )
     async def check_studio_status(self, **_):
-        """检查 RVC Studio 状态"""
+        """检查 RVC Studio 状态并返回可用模型列表"""
         if not self._studio_available:
             return Ok({
                 "online": False,
                 "models": [],
                 "status": "RVC Studio 未启动",
                 "message": "请先启动 RVC Studio 独立程序",
+                "default_model": self._default_model,
             })
 
         status, data = await self._http_client.get(
             "/api/status", timeout=5,
         )
-        if status == 200:
-            return Ok(data if isinstance(data, dict) else {"raw": data})
+        if status == 200 and isinstance(data, dict):
+            # 额外获取详细模型列表（/api/models）
+            models_list = []
+            try:
+                m_status, m_data = await self._http_client.get("/api/models", timeout=5)
+                if m_status == 200 and isinstance(m_data, dict):
+                    models_list = m_data.get("models", [])
+            except Exception:
+                models_list = data.get("models", [])
+            
+            result = {
+                "online": True,
+                "status": data.get("status", "unknown"),
+                "rvc_ready": data.get("rvc_ready", False),
+                "models": models_list,
+                "model_count": len(models_list),
+                "default_model": self._default_model,
+                "current_model": data.get("current_model", ""),
+                "message": f"RVC Studio 在线 | 可用模型: {len(models_list)} 个 | 默认模型: {self._default_model}"
+            }
+            return Ok(result)
         elif status == -1:
             err = data.get("error", "unknown") if isinstance(data, dict) else str(data)
             return Err(SdkError(
@@ -763,11 +957,13 @@ class RvcSingerPlugin(NekoPluginBase):
         else:
             return Err(SdkError(f"获取状态失败: HTTP {status}"))
 
-    @llm_tool(
-        name="reconnect_studio",
-        description="手动强制重新连接RVC Studio独立程序。当Studio刚启动或连接异常、用户说'重连'时调用。",
-        parameters={"type": "object", "properties": {}},
-        timeout=15.0,
+    @ui.action(
+        label="🔗 重新连接",
+        icon="🔗",
+        tone="primary",
+        group="connection",
+        order=5,
+        refresh_context=True,
     )
     @plugin_entry(
         id="reconnect_studio",
@@ -779,14 +975,6 @@ class RvcSingerPlugin(NekoPluginBase):
         ),
         input_schema={"type": "object", "properties": {}},
         llm_result_fields=["online", "message", "studio_url", "models"],
-    )
-    @ui.action(
-        label="🔗 重新连接",
-        icon="🔗",
-        tone="primary",
-        group="connection",
-        order=5,
-        refresh_context=True,
     )
     async def reconnect_studio(self, **_):
         """手动重连 RVC Studio
@@ -806,7 +994,10 @@ class RvcSingerPlugin(NekoPluginBase):
                 self._studio_host = settings.get("rvc_studio_host", self._studio_host)
                 self._studio_port = int(settings.get("rvc_studio_port", self._studio_port))
                 self._rvc_root = settings.get("rvc_root_path", self._rvc_root)
-                self._default_model = settings.get("default_model", self._default_model)
+                # 仅当 store 中有非空模型名时才覆盖，避免空字符串冲掉 GUI 同步的值
+                store_model = settings.get("default_model", "")
+                if store_model:
+                    self._default_model = store_model
                 self.logger.info("从 store 读取配置: host=%s, port=%d", self._studio_host, self._studio_port)
         except Exception as e:
             self.logger.warning("读取 store 配置失败，回退到内存缓存: %s", e)
@@ -821,19 +1012,26 @@ class RvcSingerPlugin(NekoPluginBase):
                 self._api_key = str(cfg_settings.get("api_key", self._api_key) or "").strip()
                 self._use_https = bool(cfg_settings.get("use_https", self._use_https))
                 self._ssl_verify = bool(cfg_settings.get("ssl_verify", self._ssl_verify))
+                # 仅当 config 中有非空模型名时才覆盖
+                cfg_model = cfg_settings.get("default_model", "")
+                if cfg_model:
+                    self._default_model = cfg_model
         except (asyncio.TimeoutError, Exception):
             self.logger.warning("config.dump() 超时，使用 store/内存缓存继续")
 
         # ── 3. 重建目标 URL + HTTP 客户端 + 清除缓存 ──
         self._studio_url = _ensure_url(self._studio_host, self._studio_port, self._use_https)
         await self._init_http_client()
-        self._cache.clear_all()
+        # M43: 选择性清理 — 只清与连接相关的缓存，保留其他类型
+        await self._cache.delete_prefix("http_")
+        await self._cache.delete("songs")  # 旧 URL 的缓存必定失效
+        await self._cache.delete("models")
         self._consecutive_failures = 0
         self._last_reported_status = ""
         self.logger.info("手动重连: 目标 = %s", self._studio_url)
         await self._send_log_to_studio("info", f"手动重连: 目标={self._studio_url}")
 
-        # ── 4. 同步健康检查 ──
+        # ── 4. 同步健康检查（内部会调用 _sync_gui_config_from_studio 同步 default_model/auto_mix）──
         await self._check_studio_now()
 
         # ── 5. 推送结果 ──
@@ -934,7 +1132,6 @@ class RvcSingerPlugin(NekoPluginBase):
                 "RVC Studio 未启动，无法获取歌曲列表。"
                 "下一步：提醒用户启动 RVC Studio，然后调用 reconnect_studio 重连"))
 
-        from urllib.parse import urlencode
         params = {}
         if q.strip():
             params["q"] = q.strip()
@@ -1017,20 +1214,6 @@ class RvcSingerPlugin(NekoPluginBase):
             error_text = data if isinstance(data, str) else json.dumps(data)
             return Err(SdkError(f"上传失败: {error_text}"))
 
-    @llm_tool(
-        name="search_and_download_song",
-        description="联网搜索并下载指定歌曲的音频文件。用于sing_song找不到本地歌曲时自动补全。用户也可直接说'帮我下载XX歌'。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "song_name": {"type": "string", "description": "要搜索的歌曲名称"},
-                "artist": {"type": "string", "description": "歌手/艺术家名，可选"},
-                "source": {"type": "string", "description": "搜索来源：auto, bilibili, youtube, netease"}
-            },
-            "required": ["song_name"]
-        },
-        timeout=300.0,
-    )
     @plugin_entry(
         id="search_and_download_song",
         name="联网搜索下载歌曲",
@@ -1165,21 +1348,6 @@ class RvcSingerPlugin(NekoPluginBase):
         # 兜底：已达最大重试次数
         return Err(SdkError("搜索下载失败（已达最大重试次数）"))
 
-    @llm_tool(
-        name="compare_voices",
-        description="A/B对比多个RVC音色模型演唱同一首歌的效果。用户说'对比模型'、'哪个音色好'、'帮我试试XX'时调用。使用2-4个模型分别转换同一歌曲片段。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "song_name": {"type": "string", "description": "用于对比的歌曲名称"},
-                "models": {"type": "array", "items": {"type": "string"}, "description": "对比的模型名列表，2-4个，留空自动选择"},
-                "pitch_shift": {"type": "integer", "description": "变调，-12到+12"},
-                "clip_seconds": {"type": "integer", "description": "对比片段秒数，默认30"}
-            },
-            "required": ["song_name"]
-        },
-        timeout=120.0,
-    )
     @plugin_entry(
         id="compare_voices",
         name="多模型对比试听",
@@ -1405,9 +1573,10 @@ class RvcSingerPlugin(NekoPluginBase):
         
         # ── 缓存读取 ──
         if self._studio_available:
-            # 尝试从缓存读取歌曲列表
-            songs_data = self._cache.get("songs") or []
-            
+            # M43: 用 _MISSING 哨兵区分"未命中"与"data 是 None/空"
+            _songs = await self._cache.get("songs")
+            songs_data = [] if _songs is _MISSING else _songs
+
             # 缓存过期或不存在，从 SQLite 歌曲库 API 获取
             if not songs_data:
                 status, resp_data = await self._http_client.get(
@@ -1415,10 +1584,10 @@ class RvcSingerPlugin(NekoPluginBase):
                 if status == 200 and isinstance(resp_data, dict):
                     songs_data = resp_data.get("songs", [])
                     songs_total = resp_data.get("total", len(songs_data))
-                    self._cache.set("songs", songs_data)
+                    await self._cache.set("songs", songs_data)
                 else:
                     self.logger.warning(f"获取歌曲列表失败: HTTP {status}")
-            
+
             # 获取歌曲库统计
             try:
                 stat_status, stat_data = await self._http_client.get(
@@ -1428,16 +1597,17 @@ class RvcSingerPlugin(NekoPluginBase):
                     songs_total = stat_data.get("total", songs_total)
             except Exception:
                 pass
-            
+
             # 尝试从缓存读取模型列表
-            models_data = self._cache.get("models") or []
-            
+            _models = await self._cache.get("models")
+            models_data = [] if _models is _MISSING else _models
+
             # 缓存过期或不存在，重新获取
             if not models_data:
                 status, resp_data = await self._http_client.get("/api/status", timeout=5)
                 if status == 200 and isinstance(resp_data, dict):
                     models_data = resp_data.get("models", [])
-                    self._cache.set("models", models_data)
+                    await self._cache.set("models", models_data)
                 else:
                     self.logger.warning(f"获取模型列表失败: HTTP {status}")
 
@@ -1466,6 +1636,14 @@ class RvcSingerPlugin(NekoPluginBase):
             },
         }
 
+    @ui.action(
+        label=tr("actions.updateConfig.label", default="Save config"),
+        icon="💾",
+        tone="success",
+        group="config",
+        order=10,
+        refresh_context=True,
+    )
     @plugin_entry(
         id="update_config",
         name=tr("entries.updateConfig.name", default="更新配置"),
@@ -1483,14 +1661,6 @@ class RvcSingerPlugin(NekoPluginBase):
                 "ssl_verify": {"type": "boolean", "description": "校验 https 证书（自签证书场景可关闭）"},
             },
         },
-    )
-    @ui.action(
-        label=tr("actions.updateConfig.label", default="Save config"),
-        icon="💾",
-        tone="success",
-        group="config",
-        order=10,
-        refresh_context=True,
     )
     async def update_config_entry(self, **kwargs):
         """通过 UI 面板更新配置
@@ -1555,7 +1725,10 @@ class RvcSingerPlugin(NekoPluginBase):
         self._studio_url = _ensure_url(self._studio_host, self._studio_port, self._use_https)
         
         await self._init_http_client()
-        self._cache.clear_all()
+        # M43: 选择性清理 — 配置变更后只清与连接/数据相关的缓存
+        await self._cache.delete_prefix("http_")
+        await self._cache.delete("songs")
+        await self._cache.delete("models")
         self._sticky_status = {}
 
         # 持久化到 store
@@ -1590,17 +1763,29 @@ class RvcSingerPlugin(NekoPluginBase):
         pitch_shift: int,
         lyrics: str = "",  # A 端传入的歌词（可选）
         postprocess: str = "none",  # P2: 音效后处理预设
+        # M6: 混音配置（可选；为空时使用 self._mix_* 已同步的值）
+        mix_preset: str | None = None,
+        mix_vocal_db: float | None = None,
+        mix_inst_db: float | None = None,
+        mix_reverb: float | None = None,
+        mix_original: float | None = None,
     ):
         """提交歌曲处理任务到 RVC Studio
-        
+
         改进：智能重试、详细错误分类、会话复用
         """
         payload = {
             "song_name": song_name,
             "model_name": model_name,
             "pitch_shift": pitch_shift,
-            "auto_mix": True,
+            "auto_mix": self._auto_mix,  # 从 GUI 同步的用户设置
             "postprocess": postprocess,
+            # M6: 混音配置（透传到 B 端 MixConfig.from_dict）
+            "mix_preset": mix_preset if mix_preset is not None else self._mix_preset,
+            "mix_vocal_db": float(mix_vocal_db) if mix_vocal_db is not None else float(self._mix_vocal_db),
+            "mix_inst_db":  float(mix_inst_db)  if mix_inst_db  is not None else float(self._mix_inst_db),
+            "mix_reverb":   float(mix_reverb)   if mix_reverb   is not None else float(self._mix_reverb),
+            "mix_original": float(mix_original) if mix_original is not None else float(self._mix_original),
         }
         # 如果 A 端传了歌词，一并提交给 B
         if lyrics and isinstance(lyrics, str) and lyrics.strip():
@@ -1748,11 +1933,12 @@ class RvcSingerPlugin(NekoPluginBase):
                                 self.logger.info(f"下载成功，重新提交任务: {song_name}")
                                 retry_count += 1
                                 
-                                # 重新提交（保留用户原始模型/变调参数，而非回退默认值）
+                                # 重新提交（保留用户原始模型/变调/后处理参数，而非回退默认值）
                                 submit_result = await self._submit_song_task(
                                     song_name,
                                     self._last_model or self._default_model,
                                     self._last_pitch_shift,
+                                    postprocess=self._last_postprocess,
                                 )
                                 if isinstance(submit_result, Ok):
                                     task_id = submit_result.value.get("task_id")
@@ -1971,8 +2157,6 @@ class RvcSingerPlugin(NekoPluginBase):
         2. music_play_url → 触发 NEKO 内置音乐播放器
         3. report_status → 歌词 + viseme 数据给前端面板（口型同步）
         """
-        from urllib.parse import quote, urlparse
-
         output_mp3_path = result_data.get("output_mp3_path", "")
         output_audio_path = result_data.get("output_audio_path", "")
         lyrics = result_data.get("lyrics", "") or ""
@@ -2006,8 +2190,7 @@ class RvcSingerPlugin(NekoPluginBase):
 
         if audio_file_path:
             # 构造 HTTP URL（通过 B 端 /output/ 静态文件路由提供，避免 file:/// 被浏览器安全策略拦截）
-            import ntpath
-            filename = ntpath.basename(audio_file_path)
+            filename = os.path.basename(audio_file_path)
             merged_url = f"{self._studio_url}/output/{quote(filename, safe='')}"
 
             self.logger.info(
@@ -2031,6 +2214,7 @@ class RvcSingerPlugin(NekoPluginBase):
                 "lyrics_preview": lyrics[:500] if lyrics else "",
                 "lyrics_source": lyrics_source,
                 "asr_quality": asr_quality,
+                "mix_note": result_data.get("mix_note", ""),
                 "compare_mode": False,
                 "compare_results": [],
             }
@@ -2075,7 +2259,7 @@ class RvcSingerPlugin(NekoPluginBase):
             if lyric_lines and len(lyric_lines) <= 30:
                 # 歌词不长时，推送到聊天区方便查阅
                 lyric_text = "\n".join(
-                    f"`{self._fmt_lyric_line(l)}`" for l in lyric_lines
+                    f"`{self._fmt_lyric_line(line)}`" for line in lyric_lines
                 )
                 try:
                     self.push_message(
@@ -2319,8 +2503,6 @@ class RvcSingerPlugin(NekoPluginBase):
         B 端出 MP3 → 此处拼完整 HTTP URL → report_status 下发 →
         player.html 面板渲染试听列表 → 面板内 <audio> 播放。
         """
-        from urllib.parse import quote
-
         raw_results = result_data.get("compare_results", []) or []
         results = []
         ok_count = 0
