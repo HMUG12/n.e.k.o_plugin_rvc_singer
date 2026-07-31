@@ -1,0 +1,13 @@
+[lint]
+# 注意：E402（延迟 import）从全局 ignore 改为 __init__.py 中的逐行 # noqa: E402，
+# 以便不吃配置的 IDE 也能正确静默；今后新增的延迟 import 也需要自己加 noqa。
+# extend-select 显式启用 E402（ruff 0.16 默认集不含它），使上述 noqa 被判定为"使用中"，
+# 否则会触发 RUF100 unused-noqa。
+extend-select = ["E402"]
+ignore = [
+    "BLE001", # 跨进程 UI 通知 catch Exception 是设计：UI 失败不能影响主流程
+    "I001",   # E402 延迟 import 让 ruff 误判 import 顺序无解，忽略更稳
+    "PLW0602",# 全局单例的 read-only global 声明是惯例
+    "S110",   # 静默保护（"failing UI shouldn't crash business"）也是项目惯例
+    "N999",   # 项目目录名 "NEKO_rvcsinger-A" 包含连字符和下划线混合，已成历史
+]

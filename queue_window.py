@@ -35,22 +35,35 @@ Floating Song Queue Window V2 — 独立桌面悬浮歌曲队列窗口
 """
 from __future__ import annotations
 
-from typing import Optional, Callable
-from queue import Queue, Empty
-import time
+from collections.abc import Callable
+from queue import Empty, Queue
 
 from PySide6.QtCore import (
-    Qt, QTimer, Signal, QObject, QPoint,
-    QPropertyAnimation, QEasingCurve, Property,
+    QEasingCurve,
+    QObject,
+    QPropertyAnimation,
+    Qt,
+    QTimer,
+    Signal,
 )
 from PySide6.QtGui import (
-    QColor, QMouseEvent, QPainter, QBrush, QPen,
-    QLinearGradient, QFont,
+    QColor,
+    QLinearGradient,
+    QMouseEvent,
+    QPainter,
 )
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QApplication, QFrame, QScrollArea, QSizePolicy,
-    QGraphicsOpacityEffect, QPushButton,
+    QApplication,
+    QFrame,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
 
@@ -129,9 +142,9 @@ class _QueueDataQueue(QObject):
 
 
 # 全局句柄
-_queue_data: Optional[_QueueDataQueue] = None
-_queue_window: Optional["QueueFloatingWindow"] = None
-_cancel_callback: Optional[Callable] = None
+_queue_data: _QueueDataQueue | None = None
+_queue_window: QueueFloatingWindow | None = None
+_cancel_callback: Callable | None = None
 
 
 def set_cancel_callback(cb: Callable):
@@ -157,6 +170,19 @@ def hide_queue_window():
     global _queue_window
     if _queue_window:
         _queue_window.hide_with_animation()
+
+
+def destroy_queue_window():
+    """销毁队列窗口（完全释放 Qt 资源，防止僵尸窗口阻塞退出）"""
+    global _queue_window
+    if _queue_window:
+        try:
+            _queue_window.hide()
+            _queue_window.close()
+            _queue_window.deleteLater()
+        except Exception:
+            pass
+        _queue_window = None
 
 
 def push_queue_data(data: dict):
@@ -307,6 +333,11 @@ class QueueFloatingWindow(QMainWindow):
         self._fade_anim.stop()
         self._fade_anim.setStartValue(self._opacity_effect.opacity())
         self._fade_anim.setEndValue(0.0)
+        # 先断开旧连接再重连，防止快速重复调用导致信号累积 → disconnect 异常
+        try:
+            self._fade_anim.finished.disconnect(self._on_fadeout_done)
+        except (TypeError, RuntimeError):
+            pass
         self._fade_anim.finished.connect(self._on_fadeout_done)
         self._fade_anim.start()
 
@@ -325,7 +356,6 @@ class QueueFloatingWindow(QMainWindow):
             self.move(event.globalPosition().toPoint() - self._drag_pos)
 
     def contextMenuEvent(self, event):
-        from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu { background: #1e1e2e; color: #cdd6f4; border:1px solid #313244; border-radius:8px; }
@@ -539,7 +569,7 @@ class QueueFloatingWindow(QMainWindow):
 
         name_lbl = QLabel(name[:22] + ("..." if len(name) > 22 else ""))
         name_lbl.setStyleSheet(
-            f"color: rgba(180,190,210,0.6); font-size:12px; background: transparent;"
+            "color: rgba(180,190,210,0.6); font-size:12px; background: transparent;"
         )
         name_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
