@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>演唱播放器</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Noto Sans CJK SC", -apple-system, BlinkMacSystemFont, sans-serif;
+    margin: 0;
+    padding: 16px;
+    background: #1a1d27;
+    color: #e4e6eb;
+    min-height: 100vh;
+  }
+  .player {
+    max-width: 600px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* 标题栏 */
+  .header {
+    text-align: center;
+    padding: 12px;
+    background: #15171f;
+    border-radius: 10px;
+  }
+  .song-title {
+    font-size: 18px;
+    font-weight: bold;
+    color: #6cb6ff;
+  }
+  .status-text {
+    font-size: 12px;
+    color: #8b9099;
+    margin-top: 4px;
+  }
+  .conn-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    margin-top: 4px;
+  }
+  .conn-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .conn-dot.online {
+    background: #4caf50;
+    box-shadow: 0 0 6px #4caf50;
+  }
+  .conn-dot.offline {
+    background: #f44336;
+    box-shadow: 0 0 6px #f44336;
+  }
+  .conn-dot.connecting {
+    background: #ff9800;
+    box-shadow: 0 0 6px #ff9800;
+    animation: pulse 1s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* 口型动画区域 */
+  .viseme-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+    background: #15171f;
+    border-radius: 10px;
+  }
+  .viseme-display {
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #2a2f3d, #1f232e);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 56px;
+    transition: transform 0.08s ease-out;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  }
+  .mouth-0 { transform: scaleY(0.08); }
+  .mouth-1 { transform: scaleY(0.28); }
+  .mouth-2 { transform: scaleY(0.58); }
+  .mouth-3 { transform: scaleY(1.0); }
+
+  /* 音频播放器 */
+  audio {
+    width: 100%;
+    border-radius: 8px;
+    outline: none;
+  }
+  audio::-webkit-media-controls-panel {
+    background: #2a2f3d;
+  }
+
+  /* 歌词区域 */
+  .lyrics {
+    min-height: 100px;
+    padding: 20px 16px;
+    background: #15171f;
+    border-radius: 10px;
+    text-align: center;
+    overflow-y: auto;
+    max-height: 200px;
+  }
+  .lyric-line {
+    padding: 5px 0;
+    color: #5a6070;
+    font-size: 15px;
+    line-height: 1.6;
+    transition: all 0.3s ease;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .lyric-line.active {
+    color: #6cb6ff;
+    font-size: 18px;
+    font-weight: bold;
+    text-shadow: 0 0 12px rgba(108,182,255,0.3);
+  }
+  .lyric-line.past {
+    color: #6a7080;
+  }
+
+  /* 空状态 */
+  .empty-state {
+    text-align: center;
+    padding: 40px;
+    color: #5a6070;
+  }
+  .empty-icon { font-size: 48px; margin-bottom: 12px; }
+  .empty-text { font-size: 14px; }
+
+  /* 进度条（用于调试） */
+  .debug-info {
+    font-size: 11px;
+    color: #4a5060;
+    text-align: center;
+    padding: 4px;
+  }
+
+  /* ── 状态面板（折叠式）── */
+  .status-panel {
+    background: #15171f;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .status-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    color: #8b9099;
+    transition: background 0.2s;
+  }
+  .status-panel-header:hover { background: #1c1f2a; }
+  .status-panel-arrow {
+    transition: transform 0.25s ease;
+    font-size: 11px;
+  }
+  .status-panel.open .status-panel-arrow { transform: rotate(90deg); }
+  .status-panel-body {
+    display: none;
+    padding: 0 14px 12px;
+    border-top: 1px solid #232733;
+  }
+  .status-panel.open .status-panel-body { display: block; }
+
+  .info-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 0;
+    font-size: 12px;
+    border-bottom: 1px dashed #232733;
+  }
+  .info-row:last-of-type { border-bottom: none; }
+  .info-key { color: #5a6070; flex-shrink: 0; }
+  .info-val {
+    color: #c8ccd4;
+    text-align: right;
+    word-break: break-all;
+    font-family: Consolas, monospace;
+  }
+  .info-val.ok { color: #4caf50; }
+  .info-val.bad { color: #f44336; }
+
+  .panel-btns {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .panel-btn {
+    flex: 1;
+    padding: 7px 0;
+    border: 1px solid #2e3442;
+    border-radius: 6px;
+    background: #1c1f2a;
+    color: #9aa3b2;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .panel-btn:hover { background: #232838; color: #6cb6ff; border-color: #6cb6ff44; }
+  .panel-btn:disabled { opacity: 0.5; cursor: wait; }
+
+  .test-result {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.6;
+    display: none;
+  }
+  .test-result.show { display: block; }
+  .test-result.ok { background: #0e2415; color: #7bd88f; border: 1px solid #1d4a2a; }
+  .test-result.bad { background: #2a1214; color: #ff8a80; border: 1px solid #5a2326; }
+
+  /* 日志查看器 */
+  .log-viewer {
+    margin-top: 8px;
+    max-height: 220px;
+    overflow-y: auto;
+    background: #0f1118;
+    border: 1px solid #232733;
+    border-radius: 6px;
+    padding: 8px;
+    display: none;
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.7;
+  }
+  .log-viewer.show { display: block; }
+  .log-entry { white-space: pre-wrap; word-break: break-all; }
+  .log-entry .log-time { color: #4a5060; }
+  .log-entry .log-level-info { color: #6cb6ff; }
+  .log-entry .log-level-warning, .log-entry .log-level-warn { color: #ffb74d; }
+  .log-entry .log-level-error { color: #ff8a80; }
+  .log-entry .log-level-debug { color: #5a6070; }
+  .log-empty { color: #4a5060; text-align: center; padding: 12px 0; }
+  .panel-hint {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #4a5060;
+    line-height: 1.5;
+  }
+
+  /* ── A/B 对比试听区 ── */
+  .compare-area {
+    background: #15171f;
+    border-radius: 10px;
+    padding: 14px;
+    display: none;
+  }
+  .compare-area.show { display: block; }
+  .compare-title {
+    font-size: 13px;
+    color: #8b9099;
+    margin-bottom: 10px;
+  }
+  .compare-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    background: #1c1f2a;
+    transition: all 0.2s;
+  }
+  .compare-row:last-child { margin-bottom: 0; }
+  .compare-row.playing {
+    background: #1d2434;
+    outline: 1px solid #6cb6ff66;
+  }
+  .compare-model {
+    font-size: 13px;
+    color: #c8ccd4;
+    word-break: break-all;
+    flex: 1;
+  }
+  .compare-row.playing .compare-model {
+    color: #6cb6ff;
+    font-weight: bold;
+  }
+  .compare-err {
+    font-size: 11px;
+    color: #ff8a80;
+    text-align: right;
+  }
+  .compare-play-btn {
+    padding: 5px 14px;
+    border: 1px solid #2e3442;
+    border-radius: 6px;
+    background: #232838;
+    color: #9aa3b2;
+    font-size: 12px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.2s;
+  }
+  .compare-play-btn:hover { color: #6cb6ff; border-color: #6cb6ff44; }
+  .compare-row.playing .compare-play-btn { color: #6cb6ff; border-color: #6cb6ff88; }
+
+  .autoplay-hint {
+    padding: 8px 12px;
+    margin: 0 0 8px 0;
+    border-radius: 8px;
+    background: #fff8e1;
+    color: #8d6e00;
+    font-size: 12px;
+    text-align: center;
+    cursor: pointer;
+    animation: hintFadeIn 0.4s ease;
+  }
+  @keyframes hintFadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+</style>
+</head>
+<body>
+
+<div class="player">
+  <!-- 标题 -->
+  <div class="header">
+    <div class="song-title" id="songTitle">等待播放...</div>
+    <div class="status-text" id="statusText">尚未连接</div>
+    <div class="conn-indicator" id="connIndicator">
+      <span class="conn-dot connecting" id="connDot"></span>
+      <span id="connLabel">检测中...</span>
+    </div>
+  </div>
+
+  <!-- 口型动画 -->
+  <div class="viseme-area">
+    <div class="viseme-display"><span id="mouth" class="mouth-0">&#x1F60A;</span></div>
+  </div>
+
+  <!-- 音频播放器（autoplay：自动播放以驱动嘴型同步） -->
+  <audio id="audioPlayer" controls preload="auto" autoplay crossorigin="anonymous"></audio>
+
+  <!-- autoplay 被拦提示（参照 NEKO music_ui.js setupAutoplayProxy） -->
+  <div class="autoplay-hint" id="autoplayHint" style="display:none;">
+    <span>&#x1F50A;</span> 浏览器拦截了自动播放，点击页面任意位置即可开始～
+  </div>
+
+  <!-- 歌词 -->
+  <div class="lyrics" id="lyrics">
+    <div class="empty-state">
+      <div class="empty-icon">&#x1F3B5;</div>
+      <div class="empty-text">说"唱首歌"开始演唱</div>
+    </div>
+  </div>
+
+  <!-- A/B 对比试听区（有 compare_results 时显示） -->
+  <div class="compare-area" id="compareArea">
+    <div class="compare-title">&#x1F3A7; A/B 音色对比试听</div>
+    <div id="compareList"></div>
+  </div>
+
+
+  <!-- 状态面板（折叠式） -->
+  <div class="status-panel" id="statusPanel">
+    <div class="status-panel-header" onclick="togglePanel()">
+      <span>&#x2699;&#xFE0F; 状态面板</span>
+      <span class="status-panel-arrow">&#x25B6;</span>
+    </div>
+    <div class="status-panel-body">
+      <div class="info-row">
+        <span class="info-key">Studio 地址</span>
+        <span class="info-val" id="infoStudioUrl">未知</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">连接状态</span>
+        <span class="info-val" id="infoConnState">检测中...</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">当前任务</span>
+        <span class="info-val" id="infoActiveTask">无</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">插件状态</span>
+        <span class="info-val" id="infoPluginStatus">-</span>
+      </div>
+      <div class="panel-btns">
+        <button class="panel-btn" id="btnTestConn" onclick="testConnection()">&#x1F50C; 测试连接</button>
+        <button class="panel-btn" id="btnViewLog" onclick="toggleLogs()">&#x1F4DC; 查看日志</button>
+      </div>
+      <div class="test-result" id="testResult"></div>
+      <div class="log-viewer" id="logViewer"></div>
+      <div class="panel-hint">提示：如需重连 Studio，请在 NEKO 插件设置面板点击「&#x1F517; 重新连接」按钮。</div>
+    </div>
+  </div>
+
+  <div class="debug-info" id="debugInfo"></div>
+
+</div>
+
+<script>
+const PLUGIN_ID = "rvc_singer";
+const POLL_MS = 500; // 轮询间隔
+let lastStatus = null;
+let lyricLines = [];
+let audioUrl = "";
+let animFrameId = null;
+let studioUrl = ""; // 来自 report_status 的 studio_url（B 端地址）
+let compareResults = []; // A/B 对比结果 [{model,url,error}]
+
+
+/* ── 轮询 report_status ── */
+
+async function pollStatus() {
+  try {
+    const resp = await fetch(`/plugins/${PLUGIN_ID}/state`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const status = data.state || data;
+    const statusStr = JSON.stringify(status);
+
+    if (statusStr !== JSON.stringify(lastStatus)) {
+      lastStatus = status;
+      handleStatus(status);
+    }
+  } catch (e) {
+    console.error("[rvc_singer] poll error:", e);
+  }
+}
+
+function handleStatus(status) {
+  // 更新连接状态指示灯
+  updateConnIndicator(status);
+
+  // 记录 Studio 地址（供状态面板直连 B 端）
+  if (status.studio_url) {
+    studioUrl = String(status.studio_url).replace(/\/+$/, "");
+  }
+
+  // 同步状态面板信息
+  updateStatusPanel(status);
+
+  // 更新标题和状态文本
+  if (status.song_name) {
+    document.getElementById("songTitle").textContent = status.song_name;
+  }
+  if (status.message) {
+    document.getElementById("statusText").textContent = status.message;
+  }
+
+
+  // 更新音频 URL
+  if (status.merged_audio_url && status.merged_audio_url !== audioUrl) {
+    audioUrl = status.merged_audio_url;
+    const player = document.getElementById("audioPlayer");
+    player.src = audioUrl;
+    player.load(); // 重新加载
+    // 新歌：使旧 autoplay 代理失效 + 隐藏旧提示
+    _autoplayProxyToken++;
+    document.getElementById("autoplayHint").style.display = "none";
+    // 自动播放（驱动嘴型同步），被拦则参照 NEKO music_ui.js setupAutoplayProxy 恢复
+    player.play().catch((err) => {
+      if (err.name === "NotAllowedError") {
+        console.warn("[rvc_singer] autoplay blocked, showing hint...");
+        showAutoplayHint(player);
+      }
+    });
+    console.log("[rvc_singer] audio URL updated:", audioUrl);
+    // 新歌开始播放 → 收起上一轮的 A/B 对比区
+    hideCompare();
+  }
+
+  // 更新歌词数据
+  if (status.lyric_lines && Array.isArray(status.lyric_lines)) {
+    lyricLines = status.lyric_lines;
+    renderLyrics();
+  }
+
+  // A/B 对比结果（NEKO 播放链路：面板内 <audio> 试听，不开浏览器）
+  if (status.compare_results && Array.isArray(status.compare_results)
+      && status.compare_results.length > 0) {
+    const sig = JSON.stringify(status.compare_results);
+    if (sig !== JSON.stringify(compareResults)) {
+      compareResults = status.compare_results;
+      renderCompare();
+      console.log("[rvc_singer] compare results updated:", compareResults.length, "models");
+    }
+  }
+}
+
+function updateConnIndicator(status) {
+  const dot = document.getElementById("connDot");
+  const label = document.getElementById("connLabel");
+  if (!dot || !label) return;
+
+  dot.className = "conn-dot";
+  if (status.studio_available === true) {
+    dot.classList.add("online");
+    label.textContent = "已连接";
+  } else if (status.status === "processing") {
+    // 正在处理任务，间接说明是连接的
+    dot.classList.add("online");
+    label.textContent = "处理中";
+  } else if (status.studio_available === false) {
+    dot.classList.add("offline");
+    label.textContent = "未连接";
+  } else {
+    dot.classList.add("connecting");
+    label.textContent = "检测中...";
+  }
+}
+
+/* ── 状态面板 ── */
+
+function updateStatusPanel(status) {
+  const urlEl = document.getElementById("infoStudioUrl");
+  const connEl = document.getElementById("infoConnState");
+  const taskEl = document.getElementById("infoActiveTask");
+  const stEl = document.getElementById("infoPluginStatus");
+  if (!urlEl) return;
+
+  urlEl.textContent = studioUrl || "未知（等待插件上报）";
+
+  connEl.className = "info-val";
+  if (status.studio_available === true) {
+    connEl.textContent = "在线";
+    connEl.classList.add("ok");
+  } else if (status.studio_available === false) {
+    connEl.textContent = "离线";
+    connEl.classList.add("bad");
+  } else {
+    connEl.textContent = "未知";
+  }
+
+  taskEl.textContent = status.active_task || "无";
+  stEl.textContent = status.status || "-";
+}
+
+function togglePanel() {
+  document.getElementById("statusPanel").classList.toggle("open");
+}
+
+/* ── autoplay 被拦恢复（参照 NEKO music_ui.js setupAutoplayProxy） ── */
+
+let _autoplayProxyToken = 0;
+
+function showAutoplayHint(player) {
+  const hint = document.getElementById("autoplayHint");
+  if (!hint) return;
+
+  // 避免重复显示
+  if (hint.style.display !== "none") return;
+
+  hint.style.display = "block";
+  const token = ++_autoplayProxyToken;
+
+  // 等待用户交互后重试播放
+  const retry = () => {
+    if (token !== _autoplayProxyToken) return;
+    hint.style.display = "none";
+    player.play().catch(() => {}); // 用户手势下不会拦
+    window.removeEventListener("mousedown", retry);
+    window.removeEventListener("touchstart", retry);
+  };
+
+  window.addEventListener("mousedown", retry, { once: true });
+  window.addEventListener("touchstart", retry, { once: true });
+  // 点击提示条本身也触发
+  hint.addEventListener("click", retry, { once: true });
+}
+
+/* ── 测试连接（直连 B 端 /api/status，B 端 CORS 全开）── */
+
+async function testConnection() {
+  const btn = document.getElementById("btnTestConn");
+  const box = document.getElementById("testResult");
+  box.className = "test-result show";
+  box.textContent = "测试中...";
+  btn.disabled = true;
+
+  if (!studioUrl) {
+    box.classList.add("bad");
+    box.textContent = "未知 Studio 地址：插件尚未上报 studio_url，请确认 NEKO 插件已启动。";
+    btn.disabled = false;
+    return;
+  }
+
+  const t0 = performance.now();
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const resp = await fetch(studioUrl + "/api/status", { signal: ctrl.signal });
+    clearTimeout(timer);
+    const ms = Math.round(performance.now() - t0);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const d = await resp.json();
+
+    const models = Array.isArray(d.models) ? d.models : [];
+    box.classList.add("ok");
+    box.innerHTML =
+      "&#x2705; 连接成功（" + ms + "ms）<br>" +
+      "引擎: " + escapeHtml(d.status || "-") +
+      "　处理中: " + (d.processing ? "是" : "否") +
+      "　排队: " + (d.queue_length != null ? d.queue_length : "-") + "<br>" +
+      "模型(" + models.length + "): " + escapeHtml(models.slice(0, 5).join(", ") || "无") +
+      (models.length > 5 ? " ..." : "");
+  } catch (e) {
+    const ms = Math.round(performance.now() - t0);
+    box.classList.add("bad");
+    box.textContent = (e.name === "AbortError")
+      ? "\u274C 连接超时（>5s）：" + studioUrl + "，请确认 RVC Studio 已启动。"
+      : "\u274C 连接失败（" + ms + "ms）：" + (e.message || e) + "。请确认 RVC Studio 已启动。";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ── 日志查看（拉取 B 端 /api/neko/log，A 端日志桥接数据）── */
+
+let logsVisible = false;
+
+async function toggleLogs() {
+  const viewer = document.getElementById("logViewer");
+  logsVisible = !logsVisible;
+  if (!logsVisible) {
+    viewer.classList.remove("show");
+    return;
+  }
+  viewer.classList.add("show");
+  await fetchLogs();
+}
+
+async function fetchLogs() {
+  const viewer = document.getElementById("logViewer");
+  const btn = document.getElementById("btnViewLog");
+  viewer.innerHTML = '<div class="log-empty">加载中...</div>';
+  btn.disabled = true;
+
+  if (!studioUrl) {
+    viewer.innerHTML = '<div class="log-empty">未知 Studio 地址，无法拉取日志</div>';
+    btn.disabled = false;
+    return;
+  }
+
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const resp = await fetch(studioUrl + "/api/neko/log?limit=50", { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const d = await resp.json();
+    const logs = Array.isArray(d.logs) ? d.logs : [];
+
+    if (logs.length === 0) {
+      viewer.innerHTML = '<div class="log-empty">暂无日志（A 端尚未上报）</div>';
+      return;
+    }
+    viewer.innerHTML = logs.map(l => {
+      const lv = String(l.level || "info").toLowerCase();
+      const ts = String(l.timestamp || "").replace("T", " ").slice(5, 19); // MM-DD HH:mm:ss
+      return '<div class="log-entry">' +
+        '<span class="log-time">' + escapeHtml(ts) + '</span> ' +
+        '<span class="log-level-' + escapeHtml(lv) + '">[' + escapeHtml(lv.toUpperCase()) + ']</span> ' +
+        escapeHtml(l.message || "") +
+        '</div>';
+    }).join("");
+    viewer.scrollTop = viewer.scrollHeight; // 滚到最新
+  } catch (e) {
+    viewer.innerHTML = '<div class="log-empty">日志拉取失败: ' + escapeHtml(e.message || String(e)) + '</div>';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ── A/B 对比试听（NEKO 播放：面板内 audio 播放） ── */
+
+function renderCompare() {
+  const area = document.getElementById("compareArea");
+  const list = document.getElementById("compareList");
+  if (!area || !list) return;
+  if (!compareResults || compareResults.length === 0) {
+    area.classList.remove("show");
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = compareResults.map((r, i) => {
+    const model = escapeHtml(r.model || "?");
+    if (r.url) {
+      return '<div class="compare-row" id="cmpRow' + i + '">' +
+        '<span class="compare-model">' + model + '</span>' +
+        '<button class="compare-play-btn" onclick="playCompare(' + i + ')">&#x25B6; 试听</button>' +
+        '</div>';
+    }
+    return '<div class="compare-row" id="cmpRow' + i + '">' +
+      '<span class="compare-model">' + model + '</span>' +
+      '<span class="compare-err">失败: ' + escapeHtml(String(r.error || "未知").slice(0, 60)) + '</span>' +
+      '</div>';
+  }).join("");
+  area.classList.add("show");
+}
+
+function playCompare(i) {
+  const r = compareResults[i];
+  if (!r || !r.url) return;
+  const player = document.getElementById("audioPlayer");
+  player.src = r.url; // 面板内播放（NEKO 播放链路），不改 audioUrl（它只跟踪整首歌）
+  player.load();
+  player.play().catch(e => console.warn("[rvc_singer] compare play blocked:", e));
+  // 标题栏显示当前试听模型 + 高亮当前行
+  document.getElementById("songTitle").textContent = "试听: " + (r.model || "?");
+  document.querySelectorAll(".compare-row").forEach((el, idx) => {
+    el.classList.toggle("playing", idx === i);
+  });
+  console.log("[rvc_singer] compare play:", r.model, r.url);
+}
+
+function hideCompare() {
+  compareResults = [];
+  const area = document.getElementById("compareArea");
+  const list = document.getElementById("compareList");
+  if (area) area.classList.remove("show");
+  if (list) list.innerHTML = "";
+}
+
+/* ── 渲染歌词 ── */
+
+
+function renderLyrics() {
+  const el = document.getElementById("lyrics");
+  if (!lyricLines || lyricLines.length === 0) {
+    el.innerHTML = '<div class="empty-state"><div class="empty-icon">&#x1F3B5;</div><div class="empty-text">暂无歌词</div></div>';
+    return;
+  }
+  el.innerHTML = lyricLines.map((l, i) =>
+    `<div class="lyric-line" data-idx="${i}" data-start="${l.start_ms || 0}" data-end="${l.end_ms || 0}">${escapeHtml(l.text || "")}</div>`
+  ).join("");
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+/* ── 同步循环（requestAnimationFrame）── */
+
+function updateSync() {
+  const audio = document.getElementById("audioPlayer");
+  if (!audio) return;
+
+  // 只在播放时更新
+  if (audio.paused || audio.ended) {
+    animFrameId = requestAnimationFrame(updateSync);
+    return;
+  }
+
+  const t = audio.currentTime * 1000; // 当前时间（毫秒）
+
+  // 1. 更新歌词高亮
+  let activeFound = false;
+  const lines = document.querySelectorAll(".lyric-line");
+  lines.forEach(el => {
+    const start = parseFloat(el.dataset.start) || 0;
+    const end = parseFloat(el.dataset.end) || 999999999;
+    const isActive = t >= start && t <= end;
+    el.classList.toggle("active", isActive);
+    el.classList.toggle("past", t > end && !isActive);
+    if (isActive) activeFound = true;
+    // 自动滚动到当前行
+    if (isActive) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  });
+
+  // 2. 更新口型
+  if (lyricLines && lyricLines.length > 0) {
+    const currentLine = lyricLines.find(l => t >= (l.start_ms || 0) && t <= (l.end_ms || 999999999));
+    if (currentLine && currentLine.visemes && currentLine.visemes.length > 0) {
+      // 在当前行的 visemes 中找对应的口型
+      const lineStart = currentLine.start_ms || 0;
+      const relativeT = t - lineStart;
+      // 找到时间点最近的 viseme
+      let matchedViseme = 0; // 默认闭嘴
+      for (let i = currentLine.visemes.length - 1; i >= 0; i--) {
+        if (relativeT >= currentLine.visemes[i].time_ms) {
+          matchedViseme = currentLine.visemes[i].viseme;
+          break;
+        }
+      }
+      setViseme(matchedViseme);
+    } else {
+      // 没有精确 viseme 数据，根据是否有活跃歌词判断张嘴程度
+      setViseme(activeFound ? 2 : 0);
+    }
+  } else {
+    setViseme(activeFound ? 2 : 0);
+  }
+
+  animFrameId = requestAnimationFrame(updateSync);
+}
+
+function setViseme(level) {
+  const mouth = document.getElementById("mouth");
+  if (!mouth) return;
+  // level: 0=闭嘴, 1=微张, 2=半开, 3=全开
+  mouth.className = "mouth-" + Math.max(0, Math.min(3, Math.round(level)));
+}
+
+/* ── 事件绑定 ── */
+
+document.addEventListener("DOMContentLoaded", function() {
+  const player = document.getElementById("audioPlayer");
+
+  player.addEventListener("play", () => {
+    console.log("[rvc_singer] playback started");
+    if (!animFrameId) updateSync();
+  });
+
+  player.addEventListener("pause", () => {
+    setViseme(0);
+  });
+
+  player.addEventListener("ended", () => {
+    setViseme(0);
+    document.querySelectorAll(".lyric-line").forEach(el => el.classList.remove("active"));
+  });
+});
+
+/* ── 启动轮询 ── */
+
+setInterval(pollStatus, POLL_MS);
+// 首次立即轮询
+pollStatus();
+
+console.log("[rvc_singer] Player panel loaded, polling every " + POLL_MS + "ms");
+</script>
+</body>
+</html>
