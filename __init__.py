@@ -2171,7 +2171,11 @@ class RvcSingerPlugin(NekoPluginBase):
                     queue_pos = data.get("queue_position", 0) if isinstance(data, dict) else 0
                     display_step = data.get("step", task_status) if isinstance(data, dict) else task_status
                     if display_step == "pending":
+<<<<<<< HEAD
                         display_step = "排队中..." if queue_pos <= 0 else f"排队中...（第{queue_pos}位）"
+=======
+                        display_step = "排队中..."
+>>>>>>> e585ebed650b45f41d264dd42ce638a8107c261e
                     try:
                         self.report_status(self._full_status(
                             status=task_status,
