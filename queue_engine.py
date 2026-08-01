@@ -17,9 +17,9 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Callable, Awaitable
 
 logger = logging.getLogger("rvc_singer.queue_engine")
 
@@ -53,7 +53,7 @@ class QueueItem:
     added_at: float = field(default_factory=time.time)
     status: QueueItemStatus = QueueItemStatus.WAITING
     task_id: str = ""
-    result: Optional[dict] = None
+    result: dict | None = None
     error: str = ""
     retry_count: int = 0
     max_retries: int = 2
@@ -63,7 +63,7 @@ class QueueItem:
 class QueueSnapshot:
     """队列当前快照，供 UI/日志/推送使用"""
     items: list[dict]
-    now_playing: Optional[str]
+    now_playing: str | None
     queue_size: int
     progress: float = 0.0
     status: str = "idle"  # idle / processing / error
@@ -115,16 +115,19 @@ class SongQueueEngine:
     def __init__(self, max_queue_size: int = 50):
         self._queue: deque[QueueItem] = deque()
         self._max_size = max_queue_size
-        self._current: Optional[QueueItem] = None
+        self._current: QueueItem | None = None
         self._lock = asyncio.Lock()
         self._cancel_flag = False  # 取消当前任务标志
+        self._scheduled_next = False  # 防止重复调度 _process_next
+        # 强引用后台 task，防止被 GC 中途回收（asyncio 官方推荐模式）
+        self._background_tasks: set[asyncio.Task] = set()
 
         # 回调钩子
-        self.submit_fn: Optional[SubmitCallback] = None
-        self.wait_fn: Optional[WaitCallback] = None
-        self.on_play_callback: Optional[PlayCallback] = None
-        self.on_snapshot_callback: Optional[SnapshotCallback] = None
-        self.on_progress_callback: Optional[ProgressCallback] = None
+        self.submit_fn: SubmitCallback | None = None
+        self.wait_fn: WaitCallback | None = None
+        self.on_play_callback: PlayCallback | None = None
+        self.on_snapshot_callback: SnapshotCallback | None = None
+        self.on_progress_callback: ProgressCallback | None = None
 
     # ── 入队 ──
 
@@ -187,44 +190,32 @@ class SongQueueEngine:
             position = self._count_waiting()
             await self._emit_snapshot()
 
-        # 如果没有在处理，立即开始
+        # 如果没有在处理且没有已调度的 next 任务，立即开始
         async with self._lock:
-            if self._current is None:
-                asyncio.create_task(self._process_next())
+            if self._current is None and not self._scheduled_next:
+                self._scheduled_next = True
+                task = asyncio.create_task(self._process_next())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
         return True, (
             f"《{song_name}》已加入队列（第 {position} 首）"
             if self._current else f"《{song_name}》开始处理中...")
-
-    async def enqueue_batch(self, songs: list[dict]) -> tuple[int, int]:
-        """批量入队。返回 (成功数, 失败数)"""
-        ok_count = fail_count = 0
-        for s in songs:
-            success, _ = await self.enqueue(
-                song_name=s.get("song_name", "??"),
-                model=s.get("model", ""),
-                pitch_shift=s.get("pitch_shift", 0),
-                priority=s.get("priority", Priority.NORMAL),
-                max_retries=s.get("max_retries", 2),
-            )
-            if success:
-                ok_count += 1
-            else:
-                fail_count += 1
-        return ok_count, fail_count
 
     # ── 取消 ──
 
     async def cancel(self, song_name: str) -> tuple[bool, str]:
         """取消队列中的某首歌（支持取消正在处理的）"""
         async with self._lock:
-            # 检查等待中的
-            for item in self._queue:
-                if item.song_name == song_name and item.status == QueueItemStatus.WAITING:
-                    item.status = QueueItemStatus.CANCELLED
-                    self._queue.remove(item)
-                    await self._emit_snapshot()
-                    return True, f"《{song_name}》已取消"
+            # 检查等待中的（先收集再删除，避免迭代中修改 deque）
+            to_cancel = [item for item in self._queue
+                         if item.song_name == song_name and item.status == QueueItemStatus.WAITING]
+            for item in to_cancel:
+                item.status = QueueItemStatus.CANCELLED
+                self._queue.remove(item)
+            if to_cancel:
+                await self._emit_snapshot()
+                return True, f"《{song_name}》已取消"
 
             # 检查当前正在处理的
             if self._current and self._current.song_name == song_name:
@@ -238,6 +229,7 @@ class SongQueueEngine:
         async with self._lock:
             self._queue.clear()
             self._cancel_flag = True
+            self._scheduled_next = False
             await self._emit_snapshot()
         logger.info("队列已清空")
 
@@ -264,9 +256,6 @@ class SongQueueEngine:
                 else "idle"
             ),
         )
-
-    def is_empty(self) -> bool:
-        return len(self._queue) == 0 and self._current is None
 
     @property
     def queue_length(self) -> int:
@@ -309,6 +298,7 @@ class SongQueueEngine:
         async with self._lock:
             if not self._queue:
                 self._current = None
+                self._scheduled_next = False  # 队列空，重置调度标志
                 await self._emit_snapshot()
                 return
 
@@ -354,9 +344,19 @@ class SongQueueEngine:
                             item.retry_count,
                             item.max_retries,
                         )
-                        # 指数退避
+                        # 指数退避（分段 sleep，每 1 秒检查取消标志）
                         delay = min(2 ** item.retry_count, 15)
-                        await asyncio.sleep(delay)
+                        _remaining = delay
+                        while _remaining > 0:
+                            if self._cancel_flag:
+                                break
+                            _chunk = min(1.0, _remaining)
+                            await asyncio.sleep(_chunk)
+                            _remaining -= _chunk
+                        if self._cancel_flag:
+                            item.status = QueueItemStatus.CANCELLED
+                            item.error = "用户取消"
+                            break
                         self._cancel_flag = False
                         continue
                     else:
@@ -366,7 +366,7 @@ class SongQueueEngine:
             except Exception as exc:
                 item.status = QueueItemStatus.FAILED
                 item.error = str(exc)
-                logger.exception("处理《%s》时异常: %s", item.song_name, exc)
+                logger.exception("处理《%s》时异常", item.song_name)
                 break
 
         # 完成后：发快照 → 处理下一首
@@ -374,12 +374,16 @@ class SongQueueEngine:
             self._current = None
             self._cancel_flag = False
             await self._emit_snapshot()
+            # 本任务已完成，先消费掉调度令牌；队列非空则立即调度下一首
+            # （原实现只在"队列为空"时复位标志，处理中来了新歌会导致队列永久卡死）
+            self._scheduled_next = False
+            if self._queue:
+                self._scheduled_next = True
+                task = asyncio.create_task(self._process_next())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
-        if self._queue:
-            await asyncio.sleep(0.6)  # 短暂间隔让 UI 刷新
-            asyncio.create_task(self._process_next())
-
-    async def _process_one(self, item: QueueItem) -> Optional[dict]:
+    async def _process_one(self, item: QueueItem) -> dict | None:
         """处理单首歌曲。返回结果字典，失败返回 None。"""
 
         # 1. 提交到 B 端
