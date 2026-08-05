@@ -26,22 +26,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
 
-# ── 将插件目录加入 sys.path，确保本地依赖（如 PySide6）可导入 ──
-_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
-
 # 按 Project N.E.K.O. 插件规范：插件自给自足，常量模块内置于本目录（config.py / paths.py）。
 # 不再 import B 端项目根；A 端与 B 端各自持有相同内容，由 sync_plugin.ps1 保持同步。
-
-from plugin.sdk.plugin import (  # noqa: E402 — 必须在 sys.path 注入之后导入
+from plugin.sdk.plugin import (  # 必须在 _bootstrap 的 sys.path 注入之后导入
     Err,
     NekoPluginBase,
     Ok,
@@ -53,14 +46,17 @@ from plugin.sdk.plugin import (  # noqa: E402 — 必须在 sys.path 注入之�
     ui,
 )
 
+# ── 将插件目录加入 sys.path（副作用在 _bootstrap 内完成，保持 import 置顶/E402 合规）──
+from . import _bootstrap as _bootstrap
+
 # 导入新的模块（核心依赖，无外部依赖）
-from .cache import (  # noqa: E402  # _MISSING 用于区分"未命中"与"data is None"
+from .cache import (  # _MISSING 用于区分"未命中"与"data is None"
     _MISSING,
     CacheLayer,
 )
-from .http_client import AsyncHttpClient  # noqa: E402
-from .queue_engine import QueueSnapshot, SongQueueEngine  # noqa: E402
-from .state import patch_sdk_error  # noqa: E402
+from .http_client import AsyncHttpClient
+from .queue_engine import QueueSnapshot, SongQueueEngine
+from .state import patch_sdk_error
 
 # ═══════════════ 插件内常量（实现细节） ══════════════
 # 按 Project N.E.K.O. 插件规范：常量要么放 plugin.toml 的 [settings]（用户可调），
@@ -2171,11 +2167,7 @@ class RvcSingerPlugin(NekoPluginBase):
                     queue_pos = data.get("queue_position", 0) if isinstance(data, dict) else 0
                     display_step = data.get("step", task_status) if isinstance(data, dict) else task_status
                     if display_step == "pending":
-<<<<<<< HEAD
                         display_step = "排队中..." if queue_pos <= 0 else f"排队中...（第{queue_pos}位）"
-=======
-                        display_step = "排队中..."
->>>>>>> e585ebed650b45f41d264dd42ce638a8107c261e
                     try:
                         self.report_status(self._full_status(
                             status=task_status,

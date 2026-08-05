@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "N.E.K.O: check rvc_singer",
+      "type": "shell",
+      "command": "uv run python -m plugin.neko_plugin_cli.cli check rvc_singer",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: sync rvc_singer",
+      "type": "shell",
+      "command": "uv run --with pip python -m plugin.neko_plugin_cli.cli sync rvc_singer --clean",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: check -r rvc_singer",
+      "type": "shell",
+      "command": "uv run python -m plugin.neko_plugin_cli.cli check -r rvc_singer",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: build rvc_singer",
+      "type": "shell",
+      "command": "uv run python -m plugin.neko_plugin_cli.cli build rvc_singer",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

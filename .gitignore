@@ -29,7 +29,8 @@ htmlcov/
 .coverage
 
 # ── Local development ──
-.vscode/
+# 注意：.vscode/ 不再忽略 — 插件市场 check --release 要求
+# .vscode/settings.json 与 .vscode/tasks.json 必须入库（对齐标准模板）
 .idea/
 *.swp
 *.swo
