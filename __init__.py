@@ -169,7 +169,8 @@ class RvcSingerPlugin(NekoPluginBase):
         self._last_model: str = ""
         self._last_pitch_shift: int = 0
         self._last_postprocess: str = "none"  # 上次使用的音效后处理预设
-        self._last_task_type: str = ""  # "sing" | "compare"
+        self._last_task_type: str = ""  # "sing"
+        self._queue_length: int = 0  # 歌曲队列长度（面板状态栏显示）
         self._auto_mix: bool = True  # 混音开关（从 GUI 同步）
         # M6: 混音配置（从 GUI 同步，供 sing_song 调用 B 端 /api/sing 时使用）
         self._mix_preset: str = "general"
@@ -247,6 +248,26 @@ class RvcSingerPlugin(NekoPluginBase):
 
         self._studio_url = _ensure_url(self._studio_host, self._studio_port, self._use_https)
         await self._init_http_client()
+
+        # ── 注册静态 UI（演唱播放器 static/player.html）──
+        # 宿主 /plugin/{id}/ui/ 只服务显式注册的 static 目录，未注册时报
+        # "Plugin 'xxx' not found or has no static directory"。
+        # music_pusher 模式：先复制到 data_path("static_ui")（运行时保证可写）
+        # 再注册该路径——直接注册插件目录会返回 False。
+        try:
+            import shutil as _shutil
+            from pathlib import Path as _Path
+            _src = _Path(__file__).resolve().parent / "static"
+            _dst = _Path(self.data_path("static_ui"))
+            if _src.is_dir():
+                _shutil.copytree(_src, _dst, dirs_exist_ok=True)
+                self._static_ui_ok = bool(self.register_static_ui(str(_dst)))
+            else:
+                self._static_ui_ok = bool(self.register_static_ui())
+            self.logger.info(f"静态 UI 注册: {self._static_ui_ok} (path={_dst})")
+        except Exception as e:
+            self._static_ui_ok = False
+            self.logger.warning(f"静态 UI 注册失败（非致命）: {e}")
 
         # ⚠️ 不在启动时阻塞做健康检查，改为后台异步进行
         self._health_task = asyncio.create_task(self._health_check_loop())
@@ -471,6 +492,7 @@ class RvcSingerPlugin(NekoPluginBase):
             "model": self._last_model,
             "progress": self._last_progress,
             "step": self._last_step,
+            "queue_length": self._queue_length,
         }
         status.update(self._sticky_status)
         status.update(overrides)
@@ -541,12 +563,12 @@ class RvcSingerPlugin(NekoPluginBase):
         name="唱首歌",
         description=(
             "让N.E.K.O用RVC训练好的声音唱歌。\n"
-            "⚠️ 使用场景：用户说'唱首歌'、'来一首'、'sing a song'等请求时调用。\n"
+            "⚠️ 使用场景：用户说'唱首歌'、'来一首'、'我想听唱歌'、'sing a song'等请求时调用。\n"
+            "⚠️ 如果 song_name 为空，先友好地询问用户想听什么歌。\n"
+            "⚠️ 用户说'随便'、'你推荐'、'看心情'，或表达情绪（如'有点难过'、'想听开心的'）时：\n"
+            "  先调用 list_songs 查看歌曲库，挑一首符合心情/氛围的歌，告诉用户你选了什么，再调用本入口。\n"
+            "⚠️ 不要询问、提及或选择声音模型，后台会自动使用默认模型。\n"
             "⚠️ Studio 连接会自动检查，如果未连接会自动返回提示，无需调用额外工具确认。\n"
-            "⚠️ 模型选择：\n"
-            "  • 用户明确说'用XX模型唱'、'换XX唱'时，传入model_name参数\n"
-            "  • 否则使用默认模型（不要主动询问用什么模型）\n"
-            "  • 可用模型列表通过 check_studio_status 查询\n"
             "🔑 歌曲名规则：song_name 必须使用 search_and_download_song 返回的 song_name 字段！\n"
             "  不要用你自己想的搜索词，因为平台存储的歌名可能不同（如日文原名 vs 中文翻译）。\n"
             "  例如：搜「怪物之歌」时返回的 song_name 是「バケモノの唄」，必须用后者调用本入口。\n"
@@ -555,8 +577,7 @@ class RvcSingerPlugin(NekoPluginBase):
             "  2. 如果返回错误'未找到歌曲音频文件'，不要直接让用户上传文件！\n"
             "  3. 而是调用 search_and_download_song 自动从网络下载歌曲\n"
             "  4. 下载成功 → 用返回的 song_name（不是搜索词）再次调用 sing_song\n"
-            "⚠️ 绝对不要直接让用户提供本地文件路径，优先用 search_and_download_song 联网下载。\n"
-            "如果 song_name 为空，先询问用户想听什么歌。"
+            "⚠️ 绝对不要直接让用户提供本地文件路径，优先用 search_and_download_song 联网下载。"
         ),
         input_schema={
             "type": "object",
@@ -567,14 +588,6 @@ class RvcSingerPlugin(NekoPluginBase):
                         "歌曲名称。如果刚用 search_and_download_song 下载了歌曲，"
                         "必须填写其返回结果中的 song_name（不要用你自己的搜索词，因为缓存的歌名可能不同）"
                     )
-                },
-                "model_name": {
-                    "type": "string",
-                    "description": (
-                        "RVC模型名称。用户明确说'用XX模型唱'、'换XX唱'时填写，"
-                        "否则留空使用默认模型。可用模型可通过 check_studio_status 查询。"
-                    ),
-                    "default": ""
                 },
                 "pitch_shift": {
                     "type": "integer",
@@ -886,10 +899,7 @@ class RvcSingerPlugin(NekoPluginBase):
 
         # 3) 通知用户
         if prev_id:
-            if self._last_task_type == "compare":
-                msg = f"喵～已取消对比任务 {prev_id}，现在可以重新开始对比啦！🎵"
-            else:
-                msg = f"喵～已取消任务 {prev_id}，现在可以重新点歌啦！🎵"
+            msg = f"喵～已取消任务 {prev_id}，现在可以重新点歌啦！🎵"
             self.push_message(
                 source="rvc_singer",
                 visibility=["chat"],
@@ -934,7 +944,7 @@ class RvcSingerPlugin(NekoPluginBase):
     @plugin_entry(
         id="check_studio_status",
         name="检查RVC Studio状态",
-        description="检查 RVC Studio 独立程序是否在线、可用模型列表、当前状态。用于查询可用的RVC声音模型。",
+        description="检查 RVC Studio 独立程序是否在线、当前状态。仅在排查连接问题时使用，正常唱歌流程无需调用。",
         input_schema={"type": "object", "properties": {}},
         llm_result_fields=["online", "models", "status", "default_model"],
     )
@@ -1373,216 +1383,6 @@ class RvcSingerPlugin(NekoPluginBase):
 
         # 兜底：已达最大重试次数
         return Err(SdkError("搜索下载失败（已达最大重试次数）"))
-
-    @plugin_entry(
-        id="compare_voices",
-        name="多模型对比试听",
-        description=(
-            "用 2~4 个不同的 RVC 音色模型演唱同一段歌曲片段，生成 A/B 对比试听。\n"
-            "⚠️ 使用场景：用户说'对比一下音色'、'哪个模型唱得好'、'A/B 测试'等请求时调用。\n"
-            "⚠️ 前置条件：RVC Studio 必须已启动；歌曲必须已存在（否则先 search_and_download_song）。\n"
-            "⚠️ 结果在「演唱播放器」面板中试听（每个模型一个试听按钮），不在聊天窗口播放。\n"
-            "⚠️ 如果用户没有指定模型，无需询问，直接传空 models 数组，后台会自动拉取可用模型并选取前 4 个进行对比。"
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "song_name": {
-                    "type": "string",
-                    "description": "歌曲名称（必填）"
-                },
-                "models": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "要对比的 RVC 模型名称列表（2~4 个）。留空或省略则自动获取可用模型选取前 4 个。"
-                },
-                "pitch_shift": {
-                    "type": "integer",
-                    "description": "变调，半音数量，0为不变",
-                    "default": 0
-                },
-                "clip_seconds": {
-                    "type": "integer",
-                    "description": "对比片段时长（秒），10~60，默认30",
-                    "default": 30
-                },
-            },
-            "required": ["song_name"],
-        },
-        llm_result_fields=["status", "song_name", "message", "models"],
-        timeout=15.0,  # 入口快速返回，后台异步处理
-    )
-    async def compare_voices(
-        self,
-        song_name: str = "",
-        models: list | None = None,
-        pitch_shift: int = 0,
-        clip_seconds: int = 30,
-        **_,
-    ):
-        """A/B 对比入口：同一段人声用多个模型各转一遍，结果推送到播放器面板试听
-
-        异步模式（与 sing_song 相同）：
-        1. 提交 POST /api/compare 拿 task_id 后快速返回
-        2. 后台协程轮询任务，完成后 report_status 推 compare_results 给 player.html
-        3. push_message 只发文本通知（NEKO 播放链路，不走浏览器）
-        """
-        # ── 参数验证 ──
-        if not song_name or not isinstance(song_name, str) or not song_name.strip():
-            return Err(SdkError("喵～请告诉我要对比的歌曲名称哦～"))
-        song_name = song_name.strip()
-
-        if not models or not isinstance(models, list) or len(models) < 2:
-            # 自动获取可用模型，无需打扰用户
-            try:
-                s, d = await self._http_client.get("/api/models", timeout=A_HTTP_TIMEOUT_DEFAULT)
-                if s == 200 and isinstance(d, dict) and d.get("models"):
-                    available = d["models"][:4]
-                    if len(available) >= 2:
-                        models = available
-                        self.logger.info(f"auto-selected models for compare: {models}")
-            except Exception:
-                pass
-        if not models or not isinstance(models, list) or len(models) < 2:
-            return Err(SdkError("当前可用模型不足 2 个，无法进行对比"))
-
-        model_list = list(dict.fromkeys(str(m).strip() for m in models if str(m).strip()))
-        if not 2 <= len(model_list) <= 4:
-            return Err(SdkError(f"对比需要 2~4 个模型，当前给了 {len(model_list)} 个"))
-
-        pitch_shift = int(pitch_shift) if pitch_shift else 0
-        if not -12 <= pitch_shift <= 12:
-            return Err(SdkError("变调范围必须在 -12 到 +12 之间"))
-
-        try:
-            clip_seconds = int(clip_seconds) if clip_seconds else 30
-        except (ValueError, TypeError):
-            clip_seconds = 30
-        clip_seconds = max(10, min(60, clip_seconds))
-
-        self._last_task_type = "compare"
-        self._last_model = model_list[0] if model_list else ""
-        self._sticky_status = {}  # 清除上一首歌曲的播放器数据
-
-        # ── 并发控制 ──
-        async with self._task_lock:
-            if self._active_task_id:
-                return Err(SdkError(
-                    f"喵～现在还有任务在处理呢（任务 {self._active_task_id}），请等它完成再来对比哦～"
-                ))
-
-        if not self._studio_available:
-            return Err(SdkError(
-                "喵～RVC Studio 还没启动的说！\n"
-                "请先打开 RVC Studio 独立程序哦～\n"
-                f"预期地址: {self._studio_url}。下一步：调用 reconnect_studio 重连"
-            ))
-
-        self.logger.info(f"A/B 对比请求: song={song_name}, models={model_list}, clip={clip_seconds}s")
-        await self._send_log_to_studio("info", f"收到对比请求: song={song_name}, models={model_list}")
-
-        # ── 提交对比任务（重试与错误分类对齐 _submit_song_task）──
-        payload = {
-            "song_name": song_name,
-            "models": model_list,
-            "pitch_shift": pitch_shift,
-            "clip_seconds": clip_seconds,
-        }
-        task_id = None
-        for attempt in range(_MAX_RETRY_ATTEMPTS):
-            status, data = await self._http_client.post(
-                "/api/compare", json_data=payload, timeout=10,
-            )
-            if status == 200 and isinstance(data, dict):
-                task_id = data.get("task_id")
-                break
-            elif status == -1:
-                err_info = data.get("error", str(data)) if isinstance(data, dict) else str(data)
-                if attempt < _MAX_RETRY_ATTEMPTS - 1:
-                    self.logger.warning(f"提交对比任务失败，重试... ({attempt + 1}/{_MAX_RETRY_ATTEMPTS}): {err_info}")
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
-                    continue
-                return Err(SdkError(
-                    f"提交对比任务超时（重试{_MAX_RETRY_ATTEMPTS}次仍失败）: {err_info}。"
-                    "下一步：调用 check_studio_status 确认服务状态后重试 compare_voices"))
-            elif status == 400 and isinstance(data, dict):
-                err_msg = data.get("error", "参数错误")
-                avail = data.get("available_models") or []
-                if avail:
-                    err_msg += f"\n可用模型: {', '.join(avail[:8])}"
-                return Err(SdkError(err_msg))
-            elif status == 429:
-                return Err(SdkError("RVC Studio 任务队列已满，请稍后再试哦～"))
-            elif status == 503:
-                self._studio_available = False
-                return Err(SdkError("RVC Studio 还在准备中呢，请稍等几秒再试哦～"))
-            else:
-                error_text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
-                return Err(SdkError(f"提交对比任务失败 (HTTP {status}): {error_text[:200]}"))
-
-        if not task_id:
-            return Err(SdkError("提交对比任务失败：未获得 task_id"))
-
-        # 标记活跃任务（二次检查 + 锁内原子化设置，与 sing_song 对齐防止 TOCTOU 竞态）
-        async with self._task_lock:
-            if self._active_task_id:
-                self.logger.warning(
-                    "竞态冲突(compare)：task_id=%s 被 task_id=%s 抢占了 active_task_id",
-                    task_id, self._active_task_id,
-                )
-                # 取消刚提交到 B 端的孤儿任务
-                try:
-                    await self._http_client.post(
-                        f"/api/task/{task_id}/cancel",
-                        json_data={},
-                        timeout=A_HTTP_TIMEOUT_DEFAULT,
-                    )
-                except Exception:
-                    pass
-                return Err(SdkError(
-                    f"喵～现在还有任务在处理呢（任务 {self._active_task_id}），请等它完成再来对比哦～"
-                ))
-            self._active_task_id = task_id
-        self._submitted_tasks[task_id] = time.time()
-        self._cancel_event.clear()
-
-        # 聊天窗口通知开始
-        self.push_message(
-            source="rvc_singer",
-            visibility=["chat"],
-            ai_behavior="blind",
-            parts=[{"type": "text", "text": (
-                f"喵～收到对比请求！正在用 {len(model_list)} 个音色"
-                f"（{', '.join(model_list)}）试唱《{song_name}》片段... 🎧"
-            )}],
-            priority=3,
-        )
-
-        # 上报状态（清除上一次的播放器数据，带全连接字段）
-        try:
-            self._sticky_status = {}
-            self.report_status(self._full_status(
-                status="processing",
-                active_task=task_id,
-                song_name=song_name,
-                progress=0,
-                step="对比任务已提交",
-            ))
-        except Exception:
-            pass
-
-        # 后台等待（不阻塞入口）
-        bg_task = asyncio.create_task(self._bg_wait_compare(task_id, song_name, model_list))
-        self._bg_tasks.add(bg_task)
-        bg_task.add_done_callback(lambda t: self._bg_tasks.discard(t))
-
-        return Ok({
-            "status": "processing",
-            "task_id": task_id,
-            "song_name": song_name,
-            "models": model_list,
-            "message": f"喵～《{song_name}》的 A/B 对比开始啦，完成后请在「演唱播放器」面板试听各模型效果哦～ 🎧",
-        })
 
     # ═══════════════ UI 面板支持 ═══════════════
 
@@ -2215,6 +2015,23 @@ class RvcSingerPlugin(NekoPluginBase):
         # asr_quality: "ok" (ASR/LRC/provided) / "degraded" (placeholder/fallback)
         asr_quality = "ok" if lyrics_source in ("provided", "lrc", "asr") else "degraded"
 
+        # 占位歌词：无歌词数据时按歌曲时长生成占位行，
+        # 保证播放器面板/浮窗有歌词滚动显示（无需真实歌词内容）
+        if not lyric_lines and duration > 0:
+            _step = 4.0
+            _n = max(1, int(duration / _step))
+            lyric_lines = [
+                {
+                    "text": "♪ ～ ♪",
+                    "time": round(i * _step, 2),
+                    "duration": _step,
+                    "start_ms": int(i * _step * 1000),
+                    "end_ms": int((i + 1) * _step * 1000),
+                }
+                for i in range(_n)
+            ]
+            self.logger.info("无歌词数据，已生成 %d 行占位歌词", _n)
+
         # 选择实际存在的音频文件
         audio_file_path = ""
 
@@ -2404,6 +2221,7 @@ class RvcSingerPlugin(NekoPluginBase):
 
     def _on_queue_snapshot(self, snapshot: QueueSnapshot):
         """队列变化回调：刷新队列浮窗（V2 引擎返回 dict 格式）"""
+        self._queue_length = getattr(snapshot, "queue_size", 0) or 0
         try:
             push_queue_data({
                 "action": "update",
@@ -2483,167 +2301,6 @@ class RvcSingerPlugin(NekoPluginBase):
             chars = [i * per_char for i in range(n_chars)]
             char_times.append({"chars": chars})
         return char_times
-
-    # ═══════════════ A/B 对比（NEKO 播放链路） ═══════════════
-
-    async def _bg_wait_compare(self, task_id: str, song_name: str, models: list[str]):
-        """后台等待对比任务完成，结果经 report_status 推送到 player.html 面板试听"""
-        try:
-            # 通知 LLM 静默
-            await self._push_busy_signal()
-
-            result = await self._wait_for_completion_with_progress(task_id, song_name)
-            if isinstance(result, Err):
-                err_msg = getattr(result.error, 'message', None) or str(result.error) if result.error else "未知错误"
-                self.logger.info(f"对比失败，推送错误消息: {err_msg}")
-                await self._send_log_to_studio("error", f"A/B 对比失败: {err_msg}")
-                try:
-                    self.push_message(
-                        source="rvc_singer",
-                        visibility=["chat"],
-                        ai_behavior="blind",
-                        parts=[{"type": "text", "text": (
-                            f"喵呜... A/B 对比失败啦 😿 原因: {err_msg}\n"
-                            "下一步：可以先 check_studio_status 看看状态，或换首歌再试哦～"
-                        )}],
-                        priority=5,
-                    )
-                except Exception as push_err:
-                    self.logger.error(f"推送错误消息失败: {push_err}")
-            else:
-                await self._push_compare_result(result.value, song_name, models)
-        except asyncio.CancelledError:
-            self._cancel_event.clear()
-            self.logger.info(f"对比后台任务被取消: {task_id}")
-        except Exception as e:
-            err_str = str(e) if str(e) else repr(e)
-            self.logger.error(f"对比后台任务异常: {err_str}")
-            try:
-                self.push_message(
-                    source="rvc_singer",
-                    visibility=["chat"],
-                    ai_behavior="blind",
-                    parts=[{"type": "text", "text": f"喵... 对比《{song_name}》的时候出了点问题 😿: {err_str}"}],
-                    priority=5,
-                )
-            except Exception as push_err:
-                self.logger.error(f"推送错误消息失败: {push_err}")
-        finally:
-            # 恢复 LLM 对话
-            try:
-                await self._clear_busy_signal()
-            except Exception:
-                pass
-
-            # 清理活跃任务标记（与 _bg_wait_and_push 一致的锁释放逻辑）
-            async with self._task_lock:
-                if self._active_task_id:
-                    self._submitted_tasks.pop(self._active_task_id, None)
-                    self._active_task_id = None
-            self._submitted_tasks.pop(task_id, None)
-            # 注意：这里不再上报"ready 空状态"覆盖，避免把刚推送的 compare_results 冲掉
-            # （健康检查循环会在 30s 内自然刷新面板的连接状态字段）
-
-    async def _push_compare_result(self, result_data: dict, song_name: str, models: list[str]):
-        """将 A/B 对比结果推送到 NEKO 播放器面板（report_status）+ 聊天文本通知
-
-        NEKO 播放链路（与整首歌 merged_audio_url 同一机制）：
-        B 端出 MP3 → 此处拼完整 HTTP URL → report_status 下发 →
-        player.html 面板渲染试听列表 → 面板内 <audio> 播放。
-        """
-        raw_results = result_data.get("compare_results", []) or []
-        results = []
-        ok_count = 0
-        for r in raw_results:
-            if not isinstance(r, dict):
-                continue
-            rel_url = r.get("url") or ""
-            full_url = ""
-            if rel_url:
-                # rel_url 形如 /output/compare_xxx.mp3 → 拼 B 端完整地址（文件名 quote）
-                filename = rel_url.rsplit("/", 1)[-1]
-                full_url = f"{self._studio_url}/output/{quote(filename, safe='')}"
-                ok_count += 1
-            results.append({
-                "model": r.get("model", "?"),
-                "url": full_url,
-                "audio_url": full_url,  # 面板消费端兼容字段
-                "ok": bool(rel_url),    # 面板消费端兼容字段
-                "error": (r.get("error") or "")[:200],
-            })
-
-        self.logger.info(
-            "report_status 对比数据: song=%s, ok=%d/%d", song_name, ok_count, len(results),
-        )
-        await self._send_log_to_studio("info", f"A/B 对比完成: {ok_count}/{len(results)} 个模型成功")
-
-        if ok_count > 0:
-            # ── 核心：report_status 传对比结果给播放器面板（NEKO 播放）──
-            # 对比结果写入 _sticky_status（跨上报保留），带全连接字段
-            # P3: _sticky_status 在 try 外赋值，确保 report_status 失败时数据不丢失
-            self._sticky_status = {
-                "message": f"喵～《{song_name}》A/B 对比完成！点各模型「试听」按钮比较喵～",
-                "compare_mode": True,
-                "compare_results": results,
-                "lyric_lines": [],  # 对比片段无歌词，清空歌词区
-                "viseme_data": [],
-                "mouth_open_y_data": [],
-                "merged_audio_url": "",
-            }
-
-            # P3: report_status 重试一次
-            for attempt in (1, 2):
-                try:
-                    self.report_status(self._full_status(
-                        status="completed",
-                        progress=100,
-                        step="对比完成",
-                        song_name=song_name,
-                        active_task=None,
-                    ))
-                    self.logger.info("report_status 推送成功 (attempt=%d, compare)", attempt)
-                    break
-                except Exception as rs_err:
-                    self.logger.error("report_status 失败 (attempt=%d): %s", attempt, rs_err)
-                    if attempt == 1:
-                        await asyncio.sleep(A_POLL_YIELD_INTERVAL)
-
-            # ── 聊天窗口文本通知（不推音频，播放在面板内）──
-            lines = [f"喵～**《{song_name}》A/B 对比完成！** 🎧"]
-            for r in results:
-                if r["url"]:
-                    lines.append(f"✅ {r['model']}")
-                else:
-                    lines.append(f"❌ {r['model']}（失败: {r['error'][:60]}）")
-            lines.append("请在「**演唱播放器**」面板点击各模型的「▶ 试听」按钮对比效果，"
-                         "选中喜欢的音色后再让我唱整首哦喵～")
-            try:
-                self.push_message(
-                    source="rvc_singer",
-                    visibility=["chat"],
-                    ai_behavior="respond",
-                    parts=[{"type": "text", "text": "\n".join(lines)}],
-                    priority=5,
-                )
-            except Exception as push_err:
-                self.logger.error("对比结果推送失败: %s", push_err)
-        else:
-            # 全部失败兜底
-            err_summary = "; ".join(
-                f"{r['model']}: {r['error'][:60]}" for r in results if r["error"]
-            ) or "未知原因"
-            try:
-                self.push_message(
-                    source="rvc_singer",
-                    visibility=["chat"],
-                    ai_behavior="blind",
-                    parts=[{"type": "text", "text": (
-                        f"喵呜... 《{song_name}》的对比全都失败了 😿\n{err_summary}"
-                    )}],
-                    priority=5,
-                )
-            except Exception as push_err:
-                self.logger.error("对比失败消息推送失败: %s", push_err)
 
     # ═══════════════ 日志桥接（A → B） ═══════════════
 
