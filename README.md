@@ -1,6 +1,6 @@
 # n.e.k.o\_plugin\_rvc\_singer
 
-> 让 N.E.K.O 用训练好的 RVC 模型唱歌 | Let N.E.K.O sing with trained RVC voice models
+> 让 N.E.K.O 用训练好的 RVC 模型唱歌 | Let N.E.K.O sing with trained RVC voice models（现已停止维护）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.0.3-blue.svg)](CHANGELOG.md)
